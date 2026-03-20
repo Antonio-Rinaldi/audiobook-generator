@@ -1,0 +1,52 @@
+[project]
+name = "audiobook-generator-cli"
+version = "0.1.0"
+description = "CLI tool to generate per-chapter audiobook files from an EPUB via local TTS backends."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Antonio-Rinaldi" }]
+keywords = ["epub", "audiobook", "tts", "ollama", "cli"]
+
+dependencies = [
+  "typer>=0.12.0",
+  "lxml>=5.1.0",
+  "requests>=2.31.0",
+  "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0.0",
+  "ruff>=0.5.0",
+  "mypy>=1.8.0",
+]
+
+[project.scripts]
+audiobook-generate = "audiobook_generator_cli.main:run"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
