@@ -39,32 +39,61 @@ _NARRATE_TAGS = frozenset(
 _WS_RE = re.compile(r"\s+")
 
 
+def _normalise_block_text(elem: etree._Element) -> str:
+    """Extract visible text from an XHTML block, preserving inline tails."""
+    parts: list[str] = []
+    if elem.text:
+        parts.append(elem.text)
+    for child in elem:
+        if child.text:
+            parts.append(child.text)
+        if child.tail:
+            parts.append(child.tail)
+    raw = " ".join(parts)
+    return _WS_RE.sub(" ", raw).strip()
+
+
+def _is_heading_tag(tag: str) -> bool:
+    return tag in {
+        f"{{{_XHTML_NS}}}h1",
+        f"{{{_XHTML_NS}}}h2",
+        f"{{{_XHTML_NS}}}h3",
+        f"{{{_XHTML_NS}}}h4",
+        f"{{{_XHTML_NS}}}h5",
+        f"{{{_XHTML_NS}}}h6",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+    }
+
+
 def _extract_text(xhtml_bytes: bytes) -> str:
-    """Return plain-text content of a chapter XHTML, one paragraph per line."""
+    """Return chapter text with title/paragraph separators to improve TTS prosody."""
     try:
         root = etree.fromstring(xhtml_bytes)
     except etree.XMLSyntaxError:
         return ""
 
-    paragraphs: list[str] = []
+    blocks: list[str] = []
     for elem in root.iter():
         if elem.tag not in _NARRATE_TAGS:
             continue
-        # Gather all text content (including tails of inline children).
-        parts: list[str] = []
-        if elem.text:
-            parts.append(elem.text)
-        for child in elem:
-            if child.text:
-                parts.append(child.text)
-            if child.tail:
-                parts.append(child.tail)
-        raw = " ".join(parts)
-        cleaned = _WS_RE.sub(" ", raw).strip()
-        if cleaned:
-            paragraphs.append(cleaned)
 
-    return "\n".join(paragraphs)
+        cleaned = _normalise_block_text(elem)
+        if not cleaned:
+            continue
+
+        if _is_heading_tag(elem.tag) and cleaned[-1] not in ".!?…:":
+            # Encourage a natural stop after titles/headings.
+            cleaned = f"{cleaned}."
+
+        blocks.append(cleaned)
+
+    # Double newline gives stronger pause between sections and paragraphs.
+    return "\n\n".join(blocks)
 
 
 @dataclass(frozen=True)
@@ -101,9 +130,15 @@ class AudiobookOrchestrator:
         total = len(book.chapters)
 
         for i, chapter in enumerate(book.chapters, start=1):
-            text = _extract_text(chapter.xhtml_bytes)
+            chapter_xhtml_bytes = chapter.xhtml_bytes
+            chapters_dir = audiobook_dir / "chapters"
+            chapters_dir.mkdir(parents=True, exist_ok=True)
+            with open(f"{chapters_dir}/chapter_{i}.xml", mode="wb") as chapter_xml:
+                chapter_xml.write(chapter_xhtml_bytes)
+
+            text = _extract_text(chapter_xhtml_bytes)
             if not text.strip():
-                logger.debug("Skipping empty chapter %s/%s | path=%s", i, total, chapter.path)
+                logger.info("Skipping empty chapter %s/%s | path=%s", i, total, chapter.path)
                 continue
 
             stem = Path(chapter.path).stem

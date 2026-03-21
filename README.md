@@ -67,10 +67,5 @@ audiobook-generate \
 - `0`: success
 - `1`: fatal error
 
-audiobook-generate \
---in /Volumes/Coding/Projects/Applications/epub/epub-translator/resources/output/vampirehunterdvolume1/vampirehunterdvolume1.italiano.epub \
---out ./resources/output/vampirehunterdvolume1/ \
---voice-model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
---voice-backend openai-speech \
---voice alloy \
---voice-base-url http://localhost:8000
+## TODO
+Send Qwen-TTS paragraphs and then merge instead of sending full chapter

@@ -16,4 +16,4 @@ def test_extract_text_collects_paragraphs_and_headings() -> None:
 
     text = _extract_text(xhtml)
 
-    assert text == "Title\nHello world !\nSecond paragraph"
+    assert text == "Title.\n\nHello world !\n\nSecond paragraph"
