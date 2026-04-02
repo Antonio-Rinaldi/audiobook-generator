@@ -89,6 +89,12 @@ def generate(
     log_level: Annotated[
         str, typer.Option("--log-level", help="Logging level: DEBUG or INFO")
     ] = "INFO",
+    workers: Annotated[
+        int, typer.Option("--workers", min=1, max=32, help="Parallel chapter workers")
+    ] = 1,
+    stream: Annotated[
+        bool, typer.Option("--stream/--no-stream", help="Use streaming response for TTS requests")
+    ] = False,
 ) -> None:
     """Generate an audiobook from an EPUB using a dedicated TTS model/backend."""
     configure_logging(log_level)
@@ -140,6 +146,8 @@ def generate(
         translated_epub_path=in_path,
         audiobook_dir=effective_out_path,
         settings=audio_settings,
+        workers=workers,
+        stream=stream,
     )
     end = time.perf_counter()
 

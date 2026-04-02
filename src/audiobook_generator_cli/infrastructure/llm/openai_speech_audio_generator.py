@@ -20,6 +20,16 @@ logger = create_logger(__name__)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 
 
+def _response_error_excerpt(resp: requests.Response, max_len: int = 200) -> str:
+    try:
+        body = resp.content or b""
+    except Exception:
+        body = b""
+    if not body:
+        return ""
+    return body.decode("utf-8", errors="replace")[:max_len]
+
+
 def _split_text_semantic(text: str, max_chars: int) -> list[str]:
     cleaned = text.strip()
     if not cleaned:
@@ -135,73 +145,84 @@ class OpenAISpeechAudioGenerator(AudioGeneratorPort):
     timeout_s: float = 6000.0
     max_chars_per_request: int = 3900
 
-    def generate(self, request: AudioRequest) -> AudioResponse:
+    def generate(
+        self, request: AudioRequest, stream: bool = False
+    ) -> AudioResponse:
+        """
+        Generate audio from text using OpenAI-speech TTS.
+        If stream=True, server responses are consumed via chunked transfer.
+        Returns AudioResponse with merged audio bytes in both modes.
+        """
         logger.debug(
-            "Calling OpenAI-speech TTS | model=%s voice=%s text_len=%s",
+            "Calling OpenAI-speech TTS | model=%s voice=%s text_len=%s stream=%s",
             request.model,
             request.voice or "(default)",
             len(request.text),
+            stream,
         )
 
-        chunks = _split_text_semantic(request.text, self.max_chars_per_request)
-        if not chunks:
+        text_chunks = _split_text_semantic(request.text, self.max_chars_per_request)
+        if not text_chunks:
             raise NonRetryableTranslationError("Empty text after preprocessing")
 
-        chunk_audio: list[bytes] = []
+        audio_chunks: list[bytes] = []
         out_fmt = "wav"
-
-        for idx, chunk in enumerate(chunks, start=1):
+        for idx, text_chunk in enumerate(text_chunks, start=1):
             payload: dict[str, str] = {
                 "model": request.model,
-                "input": chunk,
+                "input": text_chunk,
+                "response_format": "wav",
             }
             if request.voice:
                 payload["voice"] = request.voice
-
             try:
-                resp = requests.post(
-                    f"{self.base_url}/v1/audio/speech",
-                    json=payload,
-                    timeout=self.timeout_s,
-                )
+                if stream:
+                    url = f"{self.base_url}/v1/audio/speech?stream=true"
+                    resp = requests.post(url, json=payload, timeout=self.timeout_s, stream=True)
+                else:
+                    url = f"{self.base_url}/v1/audio/speech"
+                    resp = requests.post(url, json=payload, timeout=self.timeout_s)
             except requests.RequestException as exc:
                 raise RetryableTranslationError(str(exc)) from exc
-
             if resp.status_code >= 500:
                 raise RetryableTranslationError(f"TTS server error: {resp.status_code}")
             if resp.status_code >= 400:
                 raise NonRetryableTranslationError(
-                    f"TTS request failed: {resp.status_code} {resp.text[:200]}"
+                    f"TTS request failed: {resp.status_code} {_response_error_excerpt(resp)}"
                 )
-
-            audio_bytes = resp.content
+            if stream:
+                audio_bytes = b"".join(
+                    chunk_bytes
+                    for chunk_bytes in resp.iter_content(chunk_size=8192)
+                    if chunk_bytes
+                )
+            else:
+                audio_bytes = resp.content
             if not audio_bytes:
                 raise RetryableTranslationError("Empty audio response from TTS server")
-
             content_type = resp.headers.get("content-type", "audio/wav")
             fmt = "mp3" if "mpeg" in content_type or "mp3" in content_type else "wav"
             out_fmt = fmt
-            chunk_audio.append(audio_bytes)
-
+            audio_chunks.append(audio_bytes)
             logger.debug(
-                "OpenAI-speech TTS chunk received | chunk=%s/%s chars=%s bytes=%s fmt=%s",
+                "OpenAI-speech TTS chunk received | chunk=%s/%s chars=%s bytes=%s fmt=%s stream=%s",
                 idx,
-                len(chunks),
-                len(chunk),
+                len(text_chunks),
+                len(text_chunk),
                 len(audio_bytes),
                 fmt,
+                stream,
             )
-
         if out_fmt == "wav":
-            merged = _concat_wav_bytes(chunk_audio)
+            merged = _concat_wav_bytes(audio_chunks)
         else:
-            merged = b"".join(chunk_audio)
-
+            merged = b"".join(audio_chunks)
         logger.debug(
-            "OpenAI-speech TTS response merged | model=%s chunks=%s bytes=%s fmt=%s",
+            "OpenAI-speech TTS response merged | model=%s chunks=%s bytes=%s fmt=%s stream=%s",
             request.model,
-            len(chunks),
+            len(text_chunks),
             len(merged),
             out_fmt,
+            stream,
         )
         return AudioResponse(audio_bytes=merged, format=out_fmt)

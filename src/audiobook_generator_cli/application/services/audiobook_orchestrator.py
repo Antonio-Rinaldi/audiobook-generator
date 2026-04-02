@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from io import BytesIO
+from pydub import AudioSegment
 
 from lxml import etree
 
@@ -12,89 +15,57 @@ from audiobook_generator_cli.infrastructure.logging.logger_factory import create
 
 logger = create_logger(__name__)
 
-# XHTML namespace used in EPUB spine files.
-_XHTML_NS = "http://www.w3.org/1999/xhtml"
-
 # Tags whose text content we want to extract for narration.
-_NARRATE_TAGS = frozenset(
-    {
-        f"{{{_XHTML_NS}}}p",
-        f"{{{_XHTML_NS}}}h1",
-        f"{{{_XHTML_NS}}}h2",
-        f"{{{_XHTML_NS}}}h3",
-        f"{{{_XHTML_NS}}}h4",
-        f"{{{_XHTML_NS}}}h5",
-        f"{{{_XHTML_NS}}}h6",
-        # Also match un-namespaced variants produced by some parsers.
-        "p",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-    }
-)
+_HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
+_NARRATABLE_TAGS = _HEADING_TAGS | {"p"}
+
 
 _WS_RE = re.compile(r"\s+")
 
 
+def _local_tag_name(tag: str | None) -> str:
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1].lower()
+
+
 def _normalise_block_text(elem: etree._Element) -> str:
-    """Extract visible text from an XHTML block, preserving inline tails."""
-    parts: list[str] = []
-    if elem.text:
-        parts.append(elem.text)
-    for child in elem:
-        if child.text:
-            parts.append(child.text)
-        if child.tail:
-            parts.append(child.tail)
-    raw = " ".join(parts)
+    """Extract visible text from an XHTML block, preserving nested inline content."""
+    raw = " ".join(text for text in elem.itertext())
     return _WS_RE.sub(" ", raw).strip()
 
 
 def _is_heading_tag(tag: str) -> bool:
-    return tag in {
-        f"{{{_XHTML_NS}}}h1",
-        f"{{{_XHTML_NS}}}h2",
-        f"{{{_XHTML_NS}}}h3",
-        f"{{{_XHTML_NS}}}h4",
-        f"{{{_XHTML_NS}}}h5",
-        f"{{{_XHTML_NS}}}h6",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-    }
+    return _local_tag_name(tag) in _HEADING_TAGS
 
 
-def _extract_text(xhtml_bytes: bytes) -> str:
-    """Return chapter text with title/paragraph separators to improve TTS prosody."""
+def _extract_paragraphs(xhtml_bytes: bytes) -> list[str]:
+    """Extract each narratable block (paragraph, heading) as a separate string."""
     try:
         root = etree.fromstring(xhtml_bytes)
     except etree.XMLSyntaxError:
-        return ""
+        logger.error("XMLSyntaxError in _extract_paragraphs")
+        return []
 
-    blocks: list[str] = []
+    paragraphs: list[str] = []
     for elem in root.iter():
-        if elem.tag not in _NARRATE_TAGS:
+        local_tag = _local_tag_name(elem.tag)
+        if local_tag not in _NARRATABLE_TAGS:
+            logger.debug("Skipping non-narratable element | tag=%s", elem.tag)
             continue
 
         cleaned = _normalise_block_text(elem)
-        if not cleaned:
+        # Skip if no word character (at least one word)
+        if not cleaned or not re.search(r"\w", cleaned):
+            logger.debug("Skipping non-narratable element | tag=%s cleaned=%r", elem.tag, cleaned)
             continue
 
         if _is_heading_tag(elem.tag) and cleaned[-1] not in ".!?…:":
-            # Encourage a natural stop after titles/headings.
+            logger.debug("Appending period to heading | tag=%s cleaned=%r", elem.tag, cleaned)
             cleaned = f"{cleaned}."
 
-        blocks.append(cleaned)
-
-    # Double newline gives stronger pause between sections and paragraphs.
-    return "\n\n".join(blocks)
-
+        paragraphs.append(cleaned)
+    return paragraphs
 
 @dataclass(frozen=True)
 class AudiobookOrchestrator:
@@ -108,64 +79,96 @@ class AudiobookOrchestrator:
     epub_repository: EpubRepositoryPort
     audio_generator: AudioGeneratorPort
 
+    def _process_chapter(
+            self,
+            i: int,
+            total: int,
+            chapter,
+            audiobook_dir: Path,
+            settings: AudioSettings,
+            stream: bool = False) -> bool:
+
+        audiobook_dir.mkdir(parents=True, exist_ok=True)
+        chapters_dir = audiobook_dir / "chapters"
+        chapters_dir.mkdir(parents=True, exist_ok=True)
+        chapter_xhtml_bytes = chapter.xhtml_bytes
+        with open(f"{chapters_dir}/chapter_{i}.xml", mode="wb") as chapter_xml:
+            chapter_xml.write(chapter_xhtml_bytes)
+
+        paragraphs = _extract_paragraphs(chapter_xhtml_bytes)
+        if not paragraphs:
+            logger.info("Skipping empty chapter %s/%s | path=%s", i, total, chapter.path)
+            return False
+        stem = Path(chapter.path).stem
+        logger.info(
+            "Generating audio %s/%s | chapter=%s paragraphs=%s",
+            i,
+            total,
+            chapter.path,
+            len(paragraphs),
+        )
+        try:
+            audio_requests = (
+                AudioRequest(model=settings.model, text=para, voice=settings.voice)
+                for idx, para in enumerate(paragraphs, start=1)
+                if para.strip()
+            )
+            audio_bytes_list = [
+                self.audio_generator.generate(request, stream=stream).audio_bytes
+                for request in audio_requests
+            ]
+            if audio_bytes_list:
+                audio_segment_generator = (
+                    AudioSegment.from_file(BytesIO(audio_bytes))
+                    for audio_bytes in audio_bytes_list
+                )
+                combined = sum(audio_segment_generator, AudioSegment.empty())
+                out_file = audiobook_dir / f"{stem}.mp3"
+                combined.export(out_file, format="mp3")
+                logger.debug("Audio written | path=%s bytes=%s", out_file, out_file.stat().st_size)
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Audio generation failed | chapter=%s error=%s", chapter.path, exc)
+        return False
+
     def generate(
         self,
         translated_epub_path: Path,
         audiobook_dir: Path,
         settings: AudioSettings,
+        workers: int = 1,
+        stream: bool = False,
     ) -> int:
-        """Generate audio for every chapter.
-
-        Returns the number of chapters successfully written.
+        """Generate audio for every chapter, processing each paragraph individually.
+        Chapters are processed in parallel, but a single chapter is processed by one worker.
         """
         logger.info(
-            "Loading EPUB for audiobook | path=%s model=%s",
+            "Loading EPUB for audiobook | path=%s model=%s workers=%s",
             translated_epub_path,
             settings.model,
+            workers,
         )
         book = self.epub_repository.load(translated_epub_path)
-        audiobook_dir.mkdir(parents=True, exist_ok=True)
-
-        written = 0
         total = len(book.chapters)
-
-        for i, chapter in enumerate(book.chapters, start=1):
-            chapter_xhtml_bytes = chapter.xhtml_bytes
-            chapters_dir = audiobook_dir / "chapters"
-            chapters_dir.mkdir(parents=True, exist_ok=True)
-            with open(f"{chapters_dir}/chapter_{i}.xml", mode="wb") as chapter_xml:
-                chapter_xml.write(chapter_xhtml_bytes)
-
-            text = _extract_text(chapter_xhtml_bytes)
-            if not text.strip():
-                logger.info("Skipping empty chapter %s/%s | path=%s", i, total, chapter.path)
-                continue
-
-            stem = Path(chapter.path).stem
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = (
+                executor.submit(
+                    self._process_chapter,
+                    i + 1,
+                    total,
+                    chapter,
+                    audiobook_dir,
+                    settings,
+                    stream
+                )
+                for i, chapter in enumerate(book.chapters))
+            written = sum(1 for future in as_completed(futures) if future.result())
 
             logger.info(
-                "Generating audio %s/%s | chapter=%s chars=%s",
-                i,
+                "Audiobook generation complete | written=%s/%s dir=%s",
+                written,
                 total,
-                chapter.path,
-                len(text),
+                audiobook_dir,
             )
+            return written
 
-            try:
-                response = self.audio_generator.generate(
-                    AudioRequest(model=settings.model, text=text, voice=settings.voice)
-                )
-                out_file = audiobook_dir / f"{stem}.{response.format}"
-                out_file.write_bytes(response.audio_bytes)
-                written += 1
-                logger.debug("Audio written | path=%s bytes=%s", out_file, len(response.audio_bytes))
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Audio generation failed | chapter=%s error=%s", chapter.path, exc)
-
-        logger.info(
-            "Audiobook generation complete | written=%s/%s dir=%s",
-            written,
-            total,
-            audiobook_dir,
-        )
-        return written

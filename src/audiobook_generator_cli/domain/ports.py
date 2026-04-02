@@ -18,7 +18,7 @@ class EpubRepositoryPort(Protocol):
 class AudioGeneratorPort(Protocol):
     """Converts text to audio bytes."""
 
-    def generate(self, request: AudioRequest) -> AudioResponse:
+    def generate(self, request: AudioRequest, stream: bool = False) -> AudioResponse:
         raise NotImplementedError
 
 

@@ -29,7 +29,7 @@ class OllamaAudioGenerator(AudioGeneratorPort):
     base_url: str = "http://localhost:11434"
     timeout_s: float = 300.0
 
-    def generate(self, request: AudioRequest) -> AudioResponse:
+    def generate(self, request: AudioRequest, stream: bool = False) -> AudioResponse:
         logger.debug(
             "Calling Ollama TTS | model=%s text_len=%s",
             request.model,
