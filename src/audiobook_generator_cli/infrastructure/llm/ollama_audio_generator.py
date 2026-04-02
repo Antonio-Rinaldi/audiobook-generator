@@ -37,11 +37,14 @@ class OllamaAudioGenerator(AudioGeneratorPort):
         )
 
         try:
+            prompt = request.text
+            if request.instructions:
+                prompt = f"Style: {request.instructions}\n\nText: {request.text}"
             resp = requests.post(
                 f"{self.base_url}/api/generate",
                 json={
                     "model": request.model,
-                    "prompt": request.text,
+                    "prompt": prompt,
                     "stream": False,
                 },
                 timeout=self.timeout_s,

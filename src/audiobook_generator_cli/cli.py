@@ -28,6 +28,7 @@ logger = create_logger(__name__)
 _BACKEND_OLLAMA = "ollama"
 _BACKEND_OPENAI_SPEECH = "openai-speech"
 _VOICE_BACKENDS = (_BACKEND_OLLAMA, _BACKEND_OPENAI_SPEECH)
+_OUTPUT_FORMATS = ("wav", "mp3")
 
 
 def _abort(msg: str) -> None:
@@ -95,6 +96,51 @@ def generate(
     stream: Annotated[
         bool, typer.Option("--stream/--no-stream", help="Use streaming response for TTS requests")
     ] = False,
+    heading_tone: Annotated[
+        str,
+        typer.Option(
+            "--heading-tone",
+            help="Optional style instruction for heading tags (h1-h6).",
+        ),
+    ] = "",
+    paragraph_tone: Annotated[
+        str,
+        typer.Option(
+            "--paragraph-tone",
+            help="Optional style instruction for paragraph/list tags.",
+        ),
+    ] = "",
+    paragraph_pause_ms: Annotated[
+        int,
+        typer.Option(
+            "--paragraph-pause-ms",
+            min=0,
+            max=10000,
+            help="Silence inserted between consecutive paragraph-like blocks.",
+        ),
+    ] = 700,
+    spool_temp_chunks: Annotated[
+        bool,
+        typer.Option(
+            "--spool-temp-chunks/--no-spool-temp-chunks",
+            help="Write per-block audio chunks to temp files before final merge to reduce memory usage.",
+        ),
+    ] = True,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--output-format",
+            "--chapter-format",
+            help="Chapter output format: wav or mp3.",
+        ),
+    ] = "wav",
+    reset_progress: Annotated[
+        bool,
+        typer.Option(
+            "--reset-progress/--no-reset-progress",
+            help="Reset resume index and temp paragraph chunks in the output directory before generation.",
+        ),
+    ] = False,
 ) -> None:
     """Generate an audiobook from an EPUB using a dedicated TTS model/backend."""
     configure_logging(log_level)
@@ -106,6 +152,10 @@ def generate(
 
     if voice_backend not in _VOICE_BACKENDS:
         _abort(f"--voice-backend must be one of: {', '.join(_VOICE_BACKENDS)}")
+
+    output_format = output_format.strip().lower()
+    if output_format not in _OUTPUT_FORMATS:
+        _abort(f"--output-format must be one of: {', '.join(_OUTPUT_FORMATS)}")
 
     effective_out_path = out_path or in_path.parent / (in_path.stem + "_audiobook")
     effective_out_path.mkdir(parents=True, exist_ok=True)
@@ -122,6 +172,11 @@ def generate(
         model=voice_model,
         base_url=effective_tts_url,
         voice=voice,
+        heading_tone=heading_tone.strip(),
+        paragraph_tone=paragraph_tone.strip(),
+        paragraph_pause_ms=paragraph_pause_ms,
+        spool_temp_chunks=spool_temp_chunks,
+        chapter_format=output_format,
     )
 
     logger.info(
@@ -148,6 +203,7 @@ def generate(
         settings=audio_settings,
         workers=workers,
         stream=stream,
+        reset_progress=reset_progress,
     )
     end = time.perf_counter()
 

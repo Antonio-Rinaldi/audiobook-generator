@@ -175,6 +175,8 @@ class OpenAISpeechAudioGenerator(AudioGeneratorPort):
             }
             if request.voice:
                 payload["voice"] = request.voice
+            if request.instructions:
+                payload["instructions"] = request.instructions
             try:
                 if stream:
                     url = f"{self.base_url}/v1/audio/speech?stream=true"

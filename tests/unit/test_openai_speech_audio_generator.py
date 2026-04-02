@@ -148,3 +148,31 @@ def test_generate_stream_mode_400_raises_non_retryable(monkeypatch) -> None:
         gen.generate(req, stream=True)
 
 
+def test_generate_includes_instructions_in_payload(monkeypatch) -> None:
+    captured_payloads: list[dict] = []
+
+    def fake_post(url: str, json: dict, timeout: float):
+        _ = url
+        _ = timeout
+        captured_payloads.append(json)
+        return _FakeResponse(_wav_bytes(80))
+
+    monkeypatch.setattr(
+        "audiobook_generator_cli.infrastructure.llm.openai_speech_audio_generator.requests.post",
+        fake_post,
+    )
+
+    gen = OpenAISpeechAudioGenerator(base_url="http://localhost:8000")
+    req = AudioRequest(
+        model="mlx-community/Voxtral-4B-TTS-2603-mlx-4bit",
+        voice="gold",
+        text="Titolo del capitolo.",
+        instructions="read headings with a formal tone",
+    )
+
+    _ = gen.generate(req)
+
+    assert captured_payloads
+    assert captured_payloads[0]["instructions"] == "read headings with a formal tone"
+
+

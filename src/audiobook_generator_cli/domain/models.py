@@ -16,6 +16,11 @@ class AudioSettings:
     model: str
     base_url: str = "http://localhost:11434"
     voice: str = ""
+    heading_tone: str = ""
+    paragraph_tone: str = ""
+    paragraph_pause_ms: int = 700
+    spool_temp_chunks: bool = True
+    chapter_format: str = "wav"
 
 
 @dataclass(frozen=True)
@@ -25,6 +30,7 @@ class AudioRequest:
     model: str
     text: str
     voice: str = ""
+    instructions: str = ""
 
 
 @dataclass(frozen=True)
