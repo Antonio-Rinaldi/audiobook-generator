@@ -8,7 +8,7 @@ merging to final chapter audio files.
 - Loads an EPUB and iterates chapter XHTML documents.
 - Extracts narratable blocks (`h1..h6`, `p`, `li`, `blockquote`, `dd`, `dt`, `figcaption`, `td`, `th`).
 - Skips punctuation-only placeholders such as `<p class="whitespace">.</p>`.
-- Calls a TTS backend per block (`openai-speech` or `ollama`).
+- Calls an OpenAI-compatible TTS backend per block (`openai-speech`).
 - Supports different style instructions for headings vs paragraph-like content.
 - Inserts configurable pauses between consecutive paragraph blocks.
 - Writes one final audio file per chapter (`wav` by default, optional `mp3`).
@@ -36,9 +36,7 @@ pip install -e ".[dev]"
 ## Requirements
 
 - Python 3.9+
-- One TTS backend:
-    - `openai-speech`: OpenAI-compatible `/v1/audio/speech` server
-    - `ollama`: model behind `/api/generate`
+- TTS backend: `openai-speech` (OpenAI-compatible `/v1/audio/speech` server)
 
 ## Quick Start
 
@@ -53,17 +51,6 @@ audiobook-generate \
   --voice gold \
   --voice-base-url http://localhost:8000 \
   --output-format wav
-```
-
-### Ollama backend
-
-```bash
-audiobook-generate \
-  --in ./sample1.italiano.epub \
-  --out ./sample1_audiobook/ \
-  --voice-model outetts \
-  --voice-backend ollama \
-  --voice-base-url http://localhost:11434
 ```
 
 ## Resume / Idempotency Model
@@ -89,7 +76,7 @@ Use `--reset-progress` to clear both `.audiobook_progress.json` and `.audio_chun
 | `--in`                                 | *(required)*           | Input EPUB path.                                           |
 | `--out`                                | `<in_stem>_audiobook/` | Output directory for chapter files and progress artifacts. |
 | `--voice-model`                        | *(required)*           | TTS model id.                                              |
-| `--voice-backend`                      | `openai-speech`        | `openai-speech` or `ollama`.                               |
+| `--voice-backend`                      | `openai-speech`        | Only `openai-speech` is supported.                         |
 | `--voice-base-url`                     | backend-specific       | Base URL of selected backend.                              |
 | `--voice`                              | `alloy`                | Voice id forwarded to backend.                             |
 | `--heading-tone`                       | `""`                   | Style instructions only for heading blocks.                |

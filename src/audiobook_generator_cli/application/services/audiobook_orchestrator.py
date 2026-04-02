@@ -79,23 +79,43 @@ def _extract_narration_blocks(xhtml_bytes: bytes) -> list[NarrationBlock]:
         logger.error("XMLSyntaxError in _extract_paragraphs")
         return []
 
-    blocks: list[NarrationBlock] = []
-    for elem in root.iter():
-        local_tag = _local_tag_name(elem.tag)
-        if local_tag not in _NARRATABLE_TAGS:
-            logger.debug("Skipping non-narratable element | tag=%s", elem.tag)
-            continue
+    all_elements = list(root.iter())
+    narratable_elements = [elem for elem in all_elements if _local_tag_name(elem.tag) in _NARRATABLE_TAGS]
 
-        cleaned = _normalise_block_text(elem)
-        if not cleaned or not _has_spoken_text(cleaned):
-            logger.debug("Skipping non-narratable element | tag=%s cleaned=%r", elem.tag, cleaned)
-            continue
+    cleaned_by_elem = {
+        elem: _normalise_block_text(elem)
+        for elem in narratable_elements
+    }
+    spoken_elements = [
+        elem
+        for elem in narratable_elements
+        if cleaned_by_elem[elem] and _has_spoken_text(cleaned_by_elem[elem])
+    ]
+    heading_period_appended = sum(
+        1
+        for elem in spoken_elements
+        if _is_heading_tag(elem.tag) and cleaned_by_elem[elem][-1] not in ".!?…:"
+    )
 
-        if _is_heading_tag(elem.tag) and cleaned[-1] not in ".!?…:":
-            logger.debug("Appending period to heading | tag=%s cleaned=%r", elem.tag, cleaned)
-            cleaned = f"{cleaned}."
+    blocks = [
+        NarrationBlock(
+            tag=_local_tag_name(elem.tag),
+            text=(
+                f"{cleaned_by_elem[elem]}."
+                if _is_heading_tag(elem.tag) and cleaned_by_elem[elem][-1] not in ".!?…:"
+                else cleaned_by_elem[elem]
+            ),
+        )
+        for elem in spoken_elements
+    ]
 
-        blocks.append(NarrationBlock(tag=local_tag, text=cleaned))
+    logger.debug(
+        "Extraction summary | narratable=%s skipped_non_narratable=%s skipped_empty=%s heading_period_appended=%s",
+        len(blocks),
+        len(all_elements) - len(narratable_elements),
+        len(narratable_elements) - len(spoken_elements),
+        heading_period_appended,
+    )
     return blocks
 
 
@@ -268,9 +288,10 @@ class AudiobookOrchestrator:
         with open(f"{chapters_dir}/chapter_{i}.xml", mode="wb") as chapter_xml:
             chapter_xml.write(chapter_xhtml_bytes)
 
+        chapter_label = f"{i}/{total} {chapter.path}"
         blocks = _extract_narration_blocks(chapter_xhtml_bytes)
         if not blocks:
-            logger.info("Skipping empty chapter %s/%s | path=%s", i, total, chapter.path)
+            logger.info("Chapter %s | skipped (no narratable blocks)", chapter_label)
             return False
 
         chapter_key = chapter.path
@@ -280,15 +301,14 @@ class AudiobookOrchestrator:
 
         chapter_state = progress.get_chapter(chapter_key)
         if chapter_state.get("completed") and out_file.exists():
-            logger.info("Skipping already completed chapter %s/%s | path=%s", i, total, chapter.path)
+            logger.info("Chapter %s | already completed, skipping", chapter_label)
             return True
 
         logger.info(
-            "Generating audio %s/%s | chapter=%s paragraphs=%s",
-            i,
-            total,
-            chapter.path,
+            "Chapter %s | start | blocks=%s output=%s",
+            chapter_label,
             len(blocks),
+            out_file,
         )
         try:
             temp_dir_path = _chapter_tmp_dir(audiobook_dir, i, chapter.path)
@@ -300,13 +320,18 @@ class AudiobookOrchestrator:
 
             if completed_blocks > 0:
                 logger.info(
-                    "Resuming chapter %s/%s from paragraph %s/%s | chapter=%s",
-                    i,
-                    total,
+                    "Chapter %s | resume from chunk %s/%s",
+                    chapter_label,
                     completed_blocks + 1,
                     len(blocks),
-                    chapter.path,
                 )
+
+            logger.debug(
+                "Chapter %s | temp_dir=%s existing_chunks=%s",
+                chapter_label,
+                temp_dir_path,
+                existing_chunks,
+            )
 
             progress.upsert_chapter_progress(
                 chapter_key=chapter_key,
@@ -317,8 +342,17 @@ class AudiobookOrchestrator:
                 completed=False,
             )
 
+            generated_chunks = 0
             for paragraph_index in range(completed_blocks + 1, len(blocks) + 1):
                 block = blocks[paragraph_index - 1]
+                logger.debug(
+                    "Chapter %s | chunk %s/%s | start | tag=%s chars=%s",
+                    chapter_label,
+                    paragraph_index,
+                    len(blocks),
+                    block.tag,
+                    len(block.text),
+                )
                 request = AudioRequest(
                     model=settings.model,
                     text=block.text,
@@ -328,7 +362,16 @@ class AudiobookOrchestrator:
                 response = self.audio_generator.generate(request, stream=stream)
                 chunk_path = temp_dir_path / f"chunk_{paragraph_index}.{response.format}"
                 chunk_path.write_bytes(response.audio_bytes)
+                generated_chunks += 1
                 completed_blocks = paragraph_index
+                logger.debug(
+                    "Chapter %s | chunk %s/%s | done | bytes=%s path=%s",
+                    chapter_label,
+                    paragraph_index,
+                    len(blocks),
+                    len(response.audio_bytes),
+                    chunk_path,
+                )
                 progress.upsert_chapter_progress(
                     chapter_key=chapter_key,
                     chapter_path=chapter.path,
@@ -362,10 +405,17 @@ class AudiobookOrchestrator:
                 completed=True,
             )
 
-            logger.debug("Audio written | path=%s bytes=%s", out_file, out_file.stat().st_size)
+            logger.info(
+                "Chapter %s | completed | generated_chunks=%s reused_chunks=%s output=%s bytes=%s",
+                chapter_label,
+                generated_chunks,
+                len(blocks) - generated_chunks,
+                out_file,
+                out_file.stat().st_size,
+            )
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.error("Audio generation failed | chapter=%s error=%s", chapter.path, exc)
+            logger.error("Chapter %s | failed | error=%s", chapter_label, exc)
         return False
 
     def generate(

@@ -12,7 +12,6 @@ from audiobook_generator_cli.application.services.audiobook_orchestrator import 
 from audiobook_generator_cli.domain.models import AudioSettings
 from audiobook_generator_cli.domain.ports import AudioGeneratorPort
 from audiobook_generator_cli.infrastructure.epub.epub_repository import ZipEpubRepository
-from audiobook_generator_cli.infrastructure.llm.ollama_audio_generator import OllamaAudioGenerator
 from audiobook_generator_cli.infrastructure.llm.openai_speech_audio_generator import (
     OpenAISpeechAudioGenerator,
 )
@@ -24,10 +23,8 @@ from audiobook_generator_cli.infrastructure.logging.logger_factory import (
 console = Console()
 logger = create_logger(__name__)
 
-# Supported voice backend identifiers.
-_BACKEND_OLLAMA = "ollama"
 _BACKEND_OPENAI_SPEECH = "openai-speech"
-_VOICE_BACKENDS = (_BACKEND_OLLAMA, _BACKEND_OPENAI_SPEECH)
+_VOICE_BACKENDS = (_BACKEND_OPENAI_SPEECH,)
 _OUTPUT_FORMATS = ("wav", "mp3")
 
 
@@ -37,12 +34,9 @@ def _abort(msg: str) -> None:
     raise typer.Exit(code=1)
 
 
-def _build_audio_generator(backend: str, base_url: str) -> AudioGeneratorPort:
-    """Instantiate the correct ``AudioGeneratorPort`` implementation."""
-    if backend == _BACKEND_OPENAI_SPEECH:
-        return OpenAISpeechAudioGenerator(base_url=base_url)
-    # Default: ollama /api/generate
-    return OllamaAudioGenerator(base_url=base_url)
+def _build_audio_generator(base_url: str) -> AudioGeneratorPort:
+    """Instantiate the OpenAI-compatible ``AudioGeneratorPort`` implementation."""
+    return OpenAISpeechAudioGenerator(base_url=base_url)
 
 
 def generate(
@@ -60,8 +54,7 @@ def generate(
         str,
         typer.Option(
             "--voice-base-url",
-            help="Base URL of the TTS server (default: http://localhost:11434 "
-            "for ollama, http://localhost:8000 for openai-speech/qwen-tts-api)",
+            help="Base URL of the TTS server (default: http://localhost:8000 for openai-speech)",
         ),
     ] = "",
     voice_backend: Annotated[
@@ -71,8 +64,7 @@ def generate(
             help=(
                 f"TTS backend to use: {' | '.join(_VOICE_BACKENDS)}. "
                 "'openai-speech' targets POST /v1/audio/speech "
-                "(Orpheus-FastAPI, Kokoro-FastAPI, …); "
-                "'ollama' targets /api/generate"
+                "(Orpheus-FastAPI, Kokoro-FastAPI, …)."
             ),
         ),
     ] = _BACKEND_OPENAI_SPEECH,
@@ -160,13 +152,11 @@ def generate(
     effective_out_path = out_path or in_path.parent / (in_path.stem + "_audiobook")
     effective_out_path.mkdir(parents=True, exist_ok=True)
 
-    # Resolve effective TTS base URL: explicit flag > per-backend default.
+    # Resolve effective TTS base URL: explicit flag > default.
     if voice_base_url:
         effective_tts_url = voice_base_url
-    elif voice_backend == _BACKEND_OPENAI_SPEECH:
-        effective_tts_url = "http://localhost:8000"
     else:
-        effective_tts_url = "http://localhost:11434"
+        effective_tts_url = "http://localhost:8000"
 
     audio_settings = AudioSettings(
         model=voice_model,
@@ -190,7 +180,7 @@ def generate(
     )
 
     epub_repo = ZipEpubRepository()
-    audio_generator = _build_audio_generator(voice_backend, effective_tts_url)
+    audio_generator = _build_audio_generator(effective_tts_url)
     audio_orchestrator = AudiobookOrchestrator(
         epub_repository=epub_repo,
         audio_generator=audio_generator,
