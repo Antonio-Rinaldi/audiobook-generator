@@ -145,6 +145,65 @@ class OpenAISpeechAudioGenerator(AudioGeneratorPort):
     timeout_s: float = 6000.0
     max_chars_per_request: int = 3900
 
+    @staticmethod
+    def _build_payload(request: AudioRequest, text_chunk: str) -> dict[str, str]:
+        optional_pairs = (
+            ("voice", request.voice),
+            ("instructions", request.instructions),
+        )
+        optional_payload = {key: value for key, value in optional_pairs if value}
+        return {
+            "model": request.model,
+            "input": text_chunk,
+            "response_format": "wav",
+            **optional_payload,
+        }
+
+    def _speech_url(self, stream: bool) -> str:
+        suffix = "?stream=true" if stream else ""
+        return f"{self.base_url}/v1/audio/speech{suffix}"
+
+    def _send_tts_request(self, payload: dict[str, str], stream: bool) -> requests.Response:
+        try:
+            if stream:
+                return requests.post(self._speech_url(stream=True), json=payload, timeout=self.timeout_s, stream=True)
+            return requests.post(self._speech_url(stream=False), json=payload, timeout=self.timeout_s)
+        except requests.RequestException as exc:
+            raise RetryableTranslationError(str(exc)) from exc
+
+    @staticmethod
+    def _extract_audio_bytes(resp: requests.Response, stream: bool) -> bytes:
+        if stream:
+            return b"".join(chunk for chunk in resp.iter_content(chunk_size=8192) if chunk)
+        return resp.content
+
+    @staticmethod
+    def _detect_output_format(resp: requests.Response) -> str:
+        content_type = resp.headers.get("content-type", "audio/wav")
+        return "mp3" if "mpeg" in content_type or "mp3" in content_type else "wav"
+
+    @staticmethod
+    def _validate_response(resp: requests.Response) -> None:
+        if resp.status_code >= 500:
+            raise RetryableTranslationError(f"TTS server error: {resp.status_code}")
+        if resp.status_code >= 400:
+            raise NonRetryableTranslationError(
+                f"TTS request failed: {resp.status_code} {_response_error_excerpt(resp)}"
+            )
+
+    @staticmethod
+    def _merge_audio_chunks(audio_chunks: list[bytes], output_format: str) -> bytes:
+        return _concat_wav_bytes(audio_chunks) if output_format == "wav" else b"".join(audio_chunks)
+
+    def _fetch_chunk_audio(self, request: AudioRequest, text_chunk: str, stream: bool) -> tuple[bytes, str]:
+        payload = self._build_payload(request, text_chunk)
+        resp = self._send_tts_request(payload, stream=stream)
+        self._validate_response(resp)
+        audio_bytes = self._extract_audio_bytes(resp, stream=stream)
+        if not audio_bytes:
+            raise RetryableTranslationError("Empty audio response from TTS server")
+        return audio_bytes, self._detect_output_format(resp)
+
     def generate(
         self, request: AudioRequest, stream: bool = False
     ) -> AudioResponse:
@@ -165,47 +224,17 @@ class OpenAISpeechAudioGenerator(AudioGeneratorPort):
         if not text_chunks:
             raise NonRetryableTranslationError("Empty text after preprocessing")
 
-        audio_chunks: list[bytes] = []
-        out_fmt = "wav"
-        for idx, text_chunk in enumerate(text_chunks, start=1):
-            payload: dict[str, str] = {
-                "model": request.model,
-                "input": text_chunk,
-                "response_format": "wav",
-            }
-            if request.voice:
-                payload["voice"] = request.voice
-            if request.instructions:
-                payload["instructions"] = request.instructions
-            try:
-                if stream:
-                    url = f"{self.base_url}/v1/audio/speech?stream=true"
-                    resp = requests.post(url, json=payload, timeout=self.timeout_s, stream=True)
-                else:
-                    url = f"{self.base_url}/v1/audio/speech"
-                    resp = requests.post(url, json=payload, timeout=self.timeout_s)
-            except requests.RequestException as exc:
-                raise RetryableTranslationError(str(exc)) from exc
-            if resp.status_code >= 500:
-                raise RetryableTranslationError(f"TTS server error: {resp.status_code}")
-            if resp.status_code >= 400:
-                raise NonRetryableTranslationError(
-                    f"TTS request failed: {resp.status_code} {_response_error_excerpt(resp)}"
-                )
-            if stream:
-                audio_bytes = b"".join(
-                    chunk_bytes
-                    for chunk_bytes in resp.iter_content(chunk_size=8192)
-                    if chunk_bytes
-                )
-            else:
-                audio_bytes = resp.content
-            if not audio_bytes:
-                raise RetryableTranslationError("Empty audio response from TTS server")
-            content_type = resp.headers.get("content-type", "audio/wav")
-            fmt = "mp3" if "mpeg" in content_type or "mp3" in content_type else "wav"
-            out_fmt = fmt
-            audio_chunks.append(audio_bytes)
+        chunk_results = [
+            self._fetch_chunk_audio(request, text_chunk, stream)
+            for text_chunk in text_chunks
+        ]
+        audio_chunks = [audio_bytes for audio_bytes, _ in chunk_results]
+        output_formats = {fmt for _, fmt in chunk_results}
+        if len(output_formats) > 1:
+            raise RetryableTranslationError("Inconsistent audio formats returned by TTS server")
+        out_fmt = next(iter(output_formats), "wav")
+
+        for idx, (text_chunk, (audio_bytes, fmt)) in enumerate(zip(text_chunks, chunk_results), start=1):
             logger.debug(
                 "OpenAI-speech TTS chunk received | chunk=%s/%s chars=%s bytes=%s fmt=%s stream=%s",
                 idx,
@@ -215,10 +244,7 @@ class OpenAISpeechAudioGenerator(AudioGeneratorPort):
                 fmt,
                 stream,
             )
-        if out_fmt == "wav":
-            merged = _concat_wav_bytes(audio_chunks)
-        else:
-            merged = b"".join(audio_chunks)
+        merged = self._merge_audio_chunks(audio_chunks, out_fmt)
         logger.debug(
             "OpenAI-speech TTS response merged | model=%s chunks=%s bytes=%s fmt=%s stream=%s",
             request.model,

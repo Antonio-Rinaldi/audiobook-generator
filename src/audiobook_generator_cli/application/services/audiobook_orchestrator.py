@@ -246,6 +246,10 @@ def _merge_temp_chunks(
             combined += AudioSegment.silent(duration=paragraph_pause_ms)
     combined.export(out_file, format=output_format)
 
+
+def _pending_block_indexes(completed_blocks: int, total_blocks: int) -> range:
+    return range(completed_blocks + 1, total_blocks + 1)
+
 @dataclass(frozen=True)
 class AudiobookOrchestrator:
     """Generate a folder of per-chapter audio files from an EPUB.
@@ -285,8 +289,7 @@ class AudiobookOrchestrator:
         chapters_dir = audiobook_dir / _CHAPTER_XML_DIR
         chapters_dir.mkdir(parents=True, exist_ok=True)
         chapter_xhtml_bytes = chapter.xhtml_bytes
-        with open(f"{chapters_dir}/chapter_{i}.xml", mode="wb") as chapter_xml:
-            chapter_xml.write(chapter_xhtml_bytes)
+        (chapters_dir / f"chapter_{i}.xml").write_bytes(chapter_xhtml_bytes)
 
         chapter_label = f"{i}/{total} {chapter.path}"
         blocks = _extract_narration_blocks(chapter_xhtml_bytes)
@@ -342,51 +345,20 @@ class AudiobookOrchestrator:
                 completed=False,
             )
 
-            generated_chunks = 0
-            for paragraph_index in range(completed_blocks + 1, len(blocks) + 1):
-                block = blocks[paragraph_index - 1]
-                logger.debug(
-                    "Chapter %s | chunk %s/%s | start | tag=%s chars=%s",
-                    chapter_label,
-                    paragraph_index,
-                    len(blocks),
-                    block.tag,
-                    len(block.text),
-                )
-                request = AudioRequest(
-                    model=settings.model,
-                    text=block.text,
-                    voice=settings.voice,
-                    instructions=_instruction_for_block(block, settings),
-                )
-                response = self.audio_generator.generate(request, stream=stream)
-                chunk_path = temp_dir_path / f"chunk_{paragraph_index}.{response.format}"
-                chunk_path.write_bytes(response.audio_bytes)
-                generated_chunks += 1
-                completed_blocks = paragraph_index
-                logger.debug(
-                    "Chapter %s | chunk %s/%s | done | bytes=%s path=%s",
-                    chapter_label,
-                    paragraph_index,
-                    len(blocks),
-                    len(response.audio_bytes),
-                    chunk_path,
-                )
-                progress.upsert_chapter_progress(
-                    chapter_key=chapter_key,
-                    chapter_path=chapter.path,
-                    total_blocks=len(blocks),
-                    completed_blocks=completed_blocks,
-                    output_file=str(out_file),
-                    completed=False,
-                )
+            generated_chunks = self._generate_missing_chunks(
+                chapter_label=chapter_label,
+                chapter_key=chapter_key,
+                chapter_path=chapter.path,
+                blocks=blocks,
+                completed_blocks=completed_blocks,
+                settings=settings,
+                temp_dir_path=temp_dir_path,
+                out_file=out_file,
+                progress=progress,
+                stream=stream,
+            )
 
-            block_audio_files: list[tuple[NarrationBlock, Path]] = []
-            for paragraph_index, block in enumerate(blocks, start=1):
-                chunk_path = _chunk_path_for_index(temp_dir_path, paragraph_index)
-                if chunk_path is None:
-                    raise RuntimeError(f"Missing chunk for paragraph {paragraph_index}")
-                block_audio_files.append((block, chunk_path))
+            block_audio_files = self._collect_block_audio_files(blocks, temp_dir_path)
 
             _merge_temp_chunks(
                 block_audio_files=block_audio_files,
@@ -417,6 +389,72 @@ class AudiobookOrchestrator:
         except Exception as exc:  # noqa: BLE001
             logger.error("Chapter %s | failed | error=%s", chapter_label, exc)
         return False
+
+    def _generate_missing_chunks(
+        self,
+        *,
+        chapter_label: str,
+        chapter_key: str,
+        chapter_path: str,
+        blocks: list[NarrationBlock],
+        completed_blocks: int,
+        settings: AudioSettings,
+        temp_dir_path: Path,
+        out_file: Path,
+        progress: ProgressIndex,
+        stream: bool,
+    ) -> int:
+        generated_chunks = 0
+        for paragraph_index in _pending_block_indexes(completed_blocks, len(blocks)):
+            block = blocks[paragraph_index - 1]
+            logger.debug(
+                "Chapter %s | chunk %s/%s | start | tag=%s chars=%s",
+                chapter_label,
+                paragraph_index,
+                len(blocks),
+                block.tag,
+                len(block.text),
+            )
+            response = self.audio_generator.generate(
+                AudioRequest(
+                    model=settings.model,
+                    text=block.text,
+                    voice=settings.voice,
+                    instructions=_instruction_for_block(block, settings),
+                ),
+                stream=stream,
+            )
+            chunk_path = temp_dir_path / f"chunk_{paragraph_index}.{response.format}"
+            chunk_path.write_bytes(response.audio_bytes)
+            generated_chunks += 1
+            logger.debug(
+                "Chapter %s | chunk %s/%s | done | bytes=%s path=%s",
+                chapter_label,
+                paragraph_index,
+                len(blocks),
+                len(response.audio_bytes),
+                chunk_path,
+            )
+            progress.upsert_chapter_progress(
+                chapter_key=chapter_key,
+                chapter_path=chapter_path,
+                total_blocks=len(blocks),
+                completed_blocks=paragraph_index,
+                output_file=str(out_file),
+                completed=False,
+            )
+        return generated_chunks
+
+    @staticmethod
+    def _collect_block_audio_files(blocks: list[NarrationBlock], temp_dir_path: Path) -> list[tuple[NarrationBlock, Path]]:
+        chunk_pairs = [
+            (block, _chunk_path_for_index(temp_dir_path, paragraph_index))
+            for paragraph_index, block in enumerate(blocks, start=1)
+        ]
+        missing_indexes = [idx for idx, (_, chunk_path) in enumerate(chunk_pairs, start=1) if chunk_path is None]
+        if missing_indexes:
+            raise RuntimeError(f"Missing chunk for paragraph {missing_indexes[0]}")
+        return [(block, chunk_path) for block, chunk_path in chunk_pairs if chunk_path is not None]
 
     def generate(
         self,
