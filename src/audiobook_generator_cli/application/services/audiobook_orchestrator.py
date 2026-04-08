@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import re
 import shutil
@@ -25,6 +26,7 @@ _NARRATABLE_TAGS = _HEADING_TAGS | {"p", "li", "blockquote", "dd", "dt", "figcap
 
 
 _WS_RE = re.compile(r"\s+")
+_INLINE_TAG_RE = re.compile(r"</?[^>]+>")
 _PROGRESS_INDEX_FILE = ".audiobook_progress.json"
 _TEMP_CHUNKS_DIR = ".audio_chuncks"
 _CHAPTER_XML_DIR = ".chapters"
@@ -55,6 +57,14 @@ def _normalise_block_text(elem: etree._Element) -> str:
 def _has_spoken_text(text: str) -> bool:
     # Keep any block with letters/digits from any alphabet, skip punctuation-only placeholders.
     return any(ch.isalnum() for ch in text)
+
+
+def _strip_inline_tags_for_tts(text: str) -> str:
+    """Remove inline XML/HTML markers from text before TTS synthesis."""
+    unescaped = html.unescape(text)
+    without_tags = _INLINE_TAG_RE.sub(" ", unescaped)
+    collapsed = _WS_RE.sub(" ", without_tags).strip()
+    return re.sub(r"\s+([,.;:!?…])", r"\1", collapsed)
 
 
 def _is_heading_tag(tag: str) -> bool:
@@ -407,18 +417,35 @@ class AudiobookOrchestrator:
         generated_chunks = 0
         for paragraph_index in _pending_block_indexes(completed_blocks, len(blocks)):
             block = blocks[paragraph_index - 1]
+            tts_text = _strip_inline_tags_for_tts(block.text)
+            if not _has_spoken_text(tts_text):
+                logger.debug(
+                    "Chapter %s | chunk %s/%s | skipped (empty after XML tag cleanup)",
+                    chapter_label,
+                    paragraph_index,
+                    len(blocks),
+                )
+                progress.upsert_chapter_progress(
+                    chapter_key=chapter_key,
+                    chapter_path=chapter_path,
+                    total_blocks=len(blocks),
+                    completed_blocks=paragraph_index,
+                    output_file=str(out_file),
+                    completed=False,
+                )
+                continue
             logger.debug(
                 "Chapter %s | chunk %s/%s | start | tag=%s chars=%s",
                 chapter_label,
                 paragraph_index,
                 len(blocks),
                 block.tag,
-                len(block.text),
+                len(tts_text),
             )
             response = self.audio_generator.generate(
                 AudioRequest(
                     model=settings.model,
-                    text=block.text,
+                    text=tts_text,
                     voice=settings.voice,
                     instructions=_instruction_for_block(block, settings),
                 ),

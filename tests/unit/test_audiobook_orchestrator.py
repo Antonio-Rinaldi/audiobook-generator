@@ -300,3 +300,50 @@ def test_generate_reset_progress_restarts_from_first_paragraph(tmp_path: Path, m
     assert (audio_dir / "ch_reset.wav").exists()
 
 
+def test_generate_strips_inline_xml_like_tags_before_tts(tmp_path: Path, monkeypatch) -> None:
+    chapter = ChapterDocument(
+        path="OEBPS/ch_tags.xhtml",
+        xhtml_bytes=(
+            b"<?xml version='1.0' encoding='utf-8'?>"
+            b"<html xmlns='http://www.w3.org/1999/xhtml'><body>"
+            b"<p>&lt;em&gt;Voce narrante&lt;/em&gt; continua.</p>"
+            b"</body></html>"
+        ),
+    )
+
+    captured: list[AudioRequest] = []
+
+    class _CollectingAudio(AudioGeneratorPort):
+        def generate(self, request: AudioRequest, stream: bool = False) -> AudioResponse:
+            _ = stream
+            captured.append(request)
+            return AudioResponse(audio_bytes=b"fake-bytes", format="wav")
+
+    def _fake_from_file(*args, **kwargs):
+        return AudioSegment.empty()
+
+    def _fake_export(self, out_f, format="wav", **kwargs):
+        Path(out_f).write_bytes(b"RIFF")
+        return None
+
+    monkeypatch.setattr(orchestrator_module.AudioSegment, "from_file", _fake_from_file)
+    monkeypatch.setattr(orchestrator_module.AudioSegment, "export", _fake_export)
+
+    book = EpubBook(
+        items={"mimetype": b"application/epub+zip", chapter.path: chapter.xhtml_bytes},
+        chapters=[chapter],
+    )
+
+    orchestrator = AudiobookOrchestrator(epub_repository=FakeRepo(book=book), audio_generator=_CollectingAudio())
+
+    written = orchestrator.generate(
+        translated_epub_path=tmp_path / "in.epub",
+        audiobook_dir=tmp_path / "audio",
+        settings=AudioSettings(model="voice-model"),
+    )
+
+    assert written == 1
+    assert len(captured) == 1
+    assert captured[0].text == "Voce narrante continua."
+
+
