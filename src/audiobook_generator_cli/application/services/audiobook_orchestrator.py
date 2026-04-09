@@ -6,7 +6,6 @@ import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 from threading import Lock
 
@@ -14,7 +13,7 @@ from pydub import AudioSegment
 
 from lxml import etree
 
-from audiobook_generator_cli.domain.models import AudioRequest, AudioSettings
+from audiobook_generator_cli.domain.models import AudioRequest, AudioSettings, ChapterDocument
 from audiobook_generator_cli.domain.ports import AudioGeneratorPort, EpubRepositoryPort
 from audiobook_generator_cli.infrastructure.logging.logger_factory import create_logger
 
@@ -28,7 +27,7 @@ _NARRATABLE_TAGS = _HEADING_TAGS | {"p", "li", "blockquote", "dd", "dt", "figcap
 _WS_RE = re.compile(r"\s+")
 _INLINE_TAG_RE = re.compile(r"</?[^>]+>")
 _PROGRESS_INDEX_FILE = ".audiobook_progress.json"
-_TEMP_CHUNKS_DIR = ".audio_chuncks"
+_TEMP_CHUNKS_DIR = ".audio_chunks"
 _CHAPTER_XML_DIR = ".chapters"
 
 _BASE_READING_INSTRUCTION = (
@@ -41,6 +40,7 @@ _HEADING_READING_INSTRUCTION = (
 
 
 def _local_tag_name(tag: str | None) -> str:
+    """Return lower-cased local tag name without XML namespace prefix."""
     if not isinstance(tag, str):
         return ""
     return tag.rsplit("}", 1)[-1].lower()
@@ -55,6 +55,7 @@ def _normalise_block_text(elem: etree._Element) -> str:
 
 
 def _has_spoken_text(text: str) -> bool:
+    """Return True when text contains at least one alphanumeric character."""
     # Keep any block with letters/digits from any alphabet, skip punctuation-only placeholders.
     return any(ch.isalnum() for ch in text)
 
@@ -68,17 +69,75 @@ def _strip_inline_tags_for_tts(text: str) -> str:
 
 
 def _is_heading_tag(tag: str) -> bool:
+    """Check whether tag belongs to heading tag set."""
     return _local_tag_name(tag) in _HEADING_TAGS
 
 
 @dataclass(frozen=True)
 class NarrationBlock:
+    """Narratable block preserving source tag and cleaned display text."""
+
     tag: str
     text: str
 
     @property
     def is_heading(self) -> bool:
+        """True when this block originates from a heading tag."""
         return self.tag in _HEADING_TAGS
+
+
+@dataclass(frozen=True)
+class ChapterJob:
+    """Immutable execution context for one chapter synthesis task."""
+
+    index: int
+    total: int
+    chapter: ChapterDocument
+    audiobook_dir: Path
+    settings: AudioSettings
+    progress: ProgressIndex
+    stream: bool
+
+    @property
+    def label(self) -> str:
+        """Human-readable chapter label used for structured logs."""
+        return f"{self.index}/{self.total} {self.chapter.path}"
+
+    @property
+    def chapter_key(self) -> str:
+        """Stable chapter key used in resume index map."""
+        return self.chapter.path
+
+    @property
+    def output_format(self) -> str:
+        """Normalized chapter output format resolved from settings."""
+        return self.settings.chapter_format.strip().lower() or "wav"
+
+    @property
+    def output_path(self) -> Path:
+        """Final chapter output path for merged audio."""
+        return self.audiobook_dir / f"{Path(self.chapter.path).stem}.{self.output_format}"
+
+    @property
+    def temp_dir(self) -> Path:
+        """Temporary directory used for per-paragraph chunk files."""
+        return _chapter_tmp_dir(self.audiobook_dir, self.index, self.chapter.path)
+
+
+@dataclass(frozen=True)
+class PreparedChapter:
+    """Prepared chapter data required by the synthesis and merge pipeline."""
+
+    job: ChapterJob
+    blocks: list[NarrationBlock]
+    completed_blocks: int
+    existing_chunks: int
+
+
+def _resume_completed_blocks(total_blocks: int, stored_progress: int, existing_chunks: int) -> int:
+    """Resolve the resume cursor by combining index state and chunk files on disk."""
+    resolved = max(stored_progress, existing_chunks)
+    return max(0, min(total_blocks, resolved))
 
 
 def _extract_narration_blocks(xhtml_bytes: bytes) -> list[NarrationBlock]:
@@ -135,17 +194,20 @@ def _extract_paragraphs(xhtml_bytes: bytes) -> list[str]:
 
 
 def _chapter_tmp_dir(audiobook_dir: Path, chapter_index: int, chapter_path: str) -> Path:
+    """Return deterministic temporary directory path for one chapter."""
     stem = Path(chapter_path).stem
     safe_stem = re.sub(r"[^A-Za-z0-9_.-]", "_", stem)
     return audiobook_dir / _TEMP_CHUNKS_DIR / f"chapter_{chapter_index}_{safe_stem}"
 
 
 def _chunk_path_for_index(chapter_tmp_dir: Path, paragraph_index: int) -> Path | None:
+    """Resolve chunk path for a paragraph index or ``None`` if missing."""
     matches = sorted(chapter_tmp_dir.glob(f"chunk_{paragraph_index}.*"))
     return matches[0] if matches else None
 
 
 def _count_contiguous_existing_chunks(chapter_tmp_dir: Path, total_blocks: int) -> int:
+    """Count contiguous chunk files from paragraph 1 without gaps."""
     count = 0
     for paragraph_index in range(1, total_blocks + 1):
         if _chunk_path_for_index(chapter_tmp_dir, paragraph_index) is None:
@@ -156,10 +218,13 @@ def _count_contiguous_existing_chunks(chapter_tmp_dir: Path, total_blocks: int) 
 
 @dataclass
 class ProgressIndex:
+    """Thread-safe checkpoint persistence for chapter and paragraph progress."""
+
     path: Path
     lock: Lock
 
     def _load_unlocked(self) -> dict:
+        """Load persisted progress payload without acquiring outer lock."""
         if not self.path.exists():
             return {"version": 1, "chapters": {}}
         try:
@@ -175,12 +240,14 @@ class ProgressIndex:
         return payload
 
     def _save_unlocked(self, payload: dict) -> None:
+        """Persist progress payload atomically without acquiring outer lock."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         temp_path.replace(self.path)
 
     def get_chapter(self, chapter_key: str) -> dict:
+        """Return shallow copy of one chapter state from progress index."""
         with self.lock:
             payload = self._load_unlocked()
             chapter_state = payload.get("chapters", {}).get(chapter_key)
@@ -197,6 +264,7 @@ class ProgressIndex:
         output_file: str,
         completed: bool,
     ) -> None:
+        """Insert or update chapter progress state in checkpoint file."""
         with self.lock:
             payload = self._load_unlocked()
             chapters = payload.setdefault("chapters", {})
@@ -211,6 +279,7 @@ class ProgressIndex:
 
 
 def _instruction_for_block(block: NarrationBlock, settings: AudioSettings) -> str:
+    """Build narration instructions according to block type and user tone flags."""
     parts = [_BASE_READING_INSTRUCTION]
     if block.is_heading:
         parts.append(_HEADING_READING_INSTRUCTION)
@@ -221,30 +290,13 @@ def _instruction_for_block(block: NarrationBlock, settings: AudioSettings) -> st
     return "\n".join(parts)
 
 
-def _merge_audio_chunks(
-    blocks: list[NarrationBlock],
-    audio_chunks: list[bytes],
-    out_file: Path,
-    paragraph_pause_ms: int,
-    output_format: str,
-) -> None:
-    combined = AudioSegment.empty()
-    for idx, audio_bytes in enumerate(audio_chunks):
-        combined += AudioSegment.from_file(BytesIO(audio_bytes))
-        is_last = idx == len(audio_chunks) - 1
-        if is_last:
-            continue
-        if (not blocks[idx].is_heading) and (not blocks[idx + 1].is_heading) and paragraph_pause_ms > 0:
-            combined += AudioSegment.silent(duration=paragraph_pause_ms)
-    combined.export(out_file, format=output_format)
-
-
 def _merge_temp_chunks(
     block_audio_files: list[tuple[NarrationBlock, Path]],
     out_file: Path,
     paragraph_pause_ms: int,
     output_format: str,
 ) -> None:
+    """Merge chunk audio files into final chapter file with paragraph pauses."""
     combined = AudioSegment.empty()
     for idx, (block, audio_path) in enumerate(block_audio_files):
         combined += AudioSegment.from_file(audio_path)
@@ -258,6 +310,7 @@ def _merge_temp_chunks(
 
 
 def _pending_block_indexes(completed_blocks: int, total_blocks: int) -> range:
+    """Return paragraph index range that still requires synthesis."""
     return range(completed_blocks + 1, total_blocks + 1)
 
 @dataclass(frozen=True)
@@ -274,6 +327,7 @@ class AudiobookOrchestrator:
 
     @staticmethod
     def _reset_progress_state(audiobook_dir: Path) -> None:
+        """Delete resume metadata and temporary chunks for a full fresh run."""
         index_path = audiobook_dir / _PROGRESS_INDEX_FILE
         temp_chunks_dir = audiobook_dir / _TEMP_CHUNKS_DIR
 
@@ -285,195 +339,195 @@ class AudiobookOrchestrator:
             shutil.rmtree(temp_chunks_dir, ignore_errors=True)
             logger.info("Removed temp chunk directory | path=%s", temp_chunks_dir)
 
-    def _process_chapter(
-            self,
-            i: int,
-            total: int,
-            chapter,
-            audiobook_dir: Path,
-            settings: AudioSettings,
-            progress: ProgressIndex,
-            stream: bool = False) -> bool:
+    @staticmethod
+    def _chapter_xml_dir(audiobook_dir: Path) -> Path:
+        """Return directory where chapter XML snapshots are stored."""
+        return audiobook_dir / _CHAPTER_XML_DIR
 
-        audiobook_dir.mkdir(parents=True, exist_ok=True)
-        chapters_dir = audiobook_dir / _CHAPTER_XML_DIR
-        chapters_dir.mkdir(parents=True, exist_ok=True)
-        chapter_xhtml_bytes = chapter.xhtml_bytes
-        (chapters_dir / f"chapter_{i}.xml").write_bytes(chapter_xhtml_bytes)
+    def _persist_chapter_xml(self, job: ChapterJob) -> None:
+        """Write raw chapter XHTML to disk to help debugging and auditability."""
+        chapter_xml_dir = self._chapter_xml_dir(job.audiobook_dir)
+        chapter_xml_dir.mkdir(parents=True, exist_ok=True)
+        (chapter_xml_dir / f"chapter_{job.index}.xml").write_bytes(job.chapter.xhtml_bytes)
 
-        chapter_label = f"{i}/{total} {chapter.path}"
-        blocks = _extract_narration_blocks(chapter_xhtml_bytes)
+    @staticmethod
+    def _is_chapter_done(chapter_state: dict, output_path: Path) -> bool:
+        """Check if a chapter is already fully completed on disk and in index."""
+        return bool(chapter_state.get("completed")) and output_path.exists()
+
+    @staticmethod
+    def _log_resume_cursor(job: ChapterJob, completed_blocks: int, total_blocks: int) -> None:
+        """Log resume information when chapter processing starts from a non-zero chunk."""
+        if completed_blocks > 0:
+            logger.info(
+                "Chapter %s | resume from chunk %s/%s",
+                job.label,
+                completed_blocks + 1,
+                total_blocks,
+            )
+
+    def _prepare_chapter(self, job: ChapterJob) -> PreparedChapter | None:
+        """Build immutable synthesis inputs for one chapter or return None if skipped."""
+        self._persist_chapter_xml(job)
+        blocks = _extract_narration_blocks(job.chapter.xhtml_bytes)
         if not blocks:
-            logger.info("Chapter %s | skipped (no narratable blocks)", chapter_label)
+            logger.info("Chapter %s | skipped (no narratable blocks)", job.label)
+            return None
+
+        chapter_state = job.progress.get_chapter(job.chapter_key)
+        if self._is_chapter_done(chapter_state, job.output_path):
+            logger.info("Chapter %s | already completed, skipping", job.label)
+            return None
+
+        job.temp_dir.mkdir(parents=True, exist_ok=True)
+        existing_chunks = _count_contiguous_existing_chunks(job.temp_dir, len(blocks))
+        stored_completed_blocks = int(chapter_state.get("completed_blocks", 0) or 0)
+        completed_blocks = _resume_completed_blocks(
+            total_blocks=len(blocks),
+            stored_progress=stored_completed_blocks,
+            existing_chunks=existing_chunks,
+        )
+        self._log_resume_cursor(job, completed_blocks, len(blocks))
+        logger.debug(
+            "Chapter %s | temp_dir=%s existing_chunks=%s",
+            job.label,
+            job.temp_dir,
+            existing_chunks,
+        )
+
+        return PreparedChapter(
+            job=job,
+            blocks=blocks,
+            completed_blocks=completed_blocks,
+            existing_chunks=existing_chunks,
+        )
+
+    @staticmethod
+    def _mark_chapter_progress(prepared: PreparedChapter, completed_blocks: int, completed: bool) -> None:
+        """Persist progress state for one chapter in resume index."""
+        prepared.job.progress.upsert_chapter_progress(
+            chapter_key=prepared.job.chapter_key,
+            chapter_path=prepared.job.chapter.path,
+            total_blocks=len(prepared.blocks),
+            completed_blocks=completed_blocks,
+            output_file=str(prepared.job.output_path),
+            completed=completed,
+        )
+
+    @staticmethod
+    def _cleanup_temp_dir(temp_dir: Path) -> None:
+        """Delete temporary chunk directory after chapter merge succeeds."""
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _finalize_chapter(self, prepared: PreparedChapter, generated_chunks: int) -> None:
+        """Merge chunks, cleanup temp files, and mark chapter as complete."""
+        block_audio_files = self._collect_block_audio_files(prepared.blocks, prepared.job.temp_dir)
+        _merge_temp_chunks(
+            block_audio_files=block_audio_files,
+            out_file=prepared.job.output_path,
+            paragraph_pause_ms=prepared.job.settings.paragraph_pause_ms,
+            output_format=prepared.job.output_format,
+        )
+        self._cleanup_temp_dir(prepared.job.temp_dir)
+        self._mark_chapter_progress(prepared, completed_blocks=len(prepared.blocks), completed=True)
+
+        logger.info(
+            "Chapter %s | completed | generated_chunks=%s reused_chunks=%s output=%s bytes=%s",
+            prepared.job.label,
+            generated_chunks,
+            len(prepared.blocks) - generated_chunks,
+            prepared.job.output_path,
+            prepared.job.output_path.stat().st_size,
+        )
+
+    def _process_chapter(self, job: ChapterJob) -> bool:
+        """Process one chapter end-to-end: extract, synthesize, merge, and checkpoint."""
+        job.audiobook_dir.mkdir(parents=True, exist_ok=True)
+
+        prepared = self._prepare_chapter(job)
+        if prepared is None:
             return False
-
-        chapter_key = chapter.path
-        stem = Path(chapter.path).stem
-        output_format = settings.chapter_format.strip().lower() or "wav"
-        out_file = audiobook_dir / f"{stem}.{output_format}"
-
-        chapter_state = progress.get_chapter(chapter_key)
-        if chapter_state.get("completed") and out_file.exists():
-            logger.info("Chapter %s | already completed, skipping", chapter_label)
-            return True
 
         logger.info(
             "Chapter %s | start | blocks=%s output=%s",
-            chapter_label,
-            len(blocks),
-            out_file,
+            prepared.job.label,
+            len(prepared.blocks),
+            prepared.job.output_path,
         )
+
         try:
-            temp_dir_path = _chapter_tmp_dir(audiobook_dir, i, chapter.path)
-            temp_dir_path.mkdir(parents=True, exist_ok=True)
-
-            existing_chunks = _count_contiguous_existing_chunks(temp_dir_path, len(blocks))
-            completed_blocks = int(chapter_state.get("completed_blocks", 0) or 0)
-            completed_blocks = max(0, min(len(blocks), max(completed_blocks, existing_chunks)))
-
-            if completed_blocks > 0:
-                logger.info(
-                    "Chapter %s | resume from chunk %s/%s",
-                    chapter_label,
-                    completed_blocks + 1,
-                    len(blocks),
-                )
-
-            logger.debug(
-                "Chapter %s | temp_dir=%s existing_chunks=%s",
-                chapter_label,
-                temp_dir_path,
-                existing_chunks,
-            )
-
-            progress.upsert_chapter_progress(
-                chapter_key=chapter_key,
-                chapter_path=chapter.path,
-                total_blocks=len(blocks),
-                completed_blocks=completed_blocks,
-                output_file=str(out_file),
-                completed=False,
-            )
+            self._mark_chapter_progress(prepared, completed_blocks=prepared.completed_blocks, completed=False)
 
             generated_chunks = self._generate_missing_chunks(
-                chapter_label=chapter_label,
-                chapter_key=chapter_key,
-                chapter_path=chapter.path,
-                blocks=blocks,
-                completed_blocks=completed_blocks,
-                settings=settings,
-                temp_dir_path=temp_dir_path,
-                out_file=out_file,
-                progress=progress,
-                stream=stream,
+                prepared=prepared,
             )
-
-            block_audio_files = self._collect_block_audio_files(blocks, temp_dir_path)
-
-            _merge_temp_chunks(
-                block_audio_files=block_audio_files,
-                out_file=out_file,
-                paragraph_pause_ms=settings.paragraph_pause_ms,
-                output_format=output_format,
-            )
-            shutil.rmtree(temp_dir_path, ignore_errors=True)
-
-            progress.upsert_chapter_progress(
-                chapter_key=chapter_key,
-                chapter_path=chapter.path,
-                total_blocks=len(blocks),
-                completed_blocks=len(blocks),
-                output_file=str(out_file),
-                completed=True,
-            )
-
-            logger.info(
-                "Chapter %s | completed | generated_chunks=%s reused_chunks=%s output=%s bytes=%s",
-                chapter_label,
-                generated_chunks,
-                len(blocks) - generated_chunks,
-                out_file,
-                out_file.stat().st_size,
-            )
+            self._finalize_chapter(prepared, generated_chunks)
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.error("Chapter %s | failed | error=%s", chapter_label, exc)
+            logger.error("Chapter %s | failed | error=%s", prepared.job.label, exc)
         return False
 
     def _generate_missing_chunks(
         self,
         *,
-        chapter_label: str,
-        chapter_key: str,
-        chapter_path: str,
-        blocks: list[NarrationBlock],
-        completed_blocks: int,
-        settings: AudioSettings,
-        temp_dir_path: Path,
-        out_file: Path,
-        progress: ProgressIndex,
-        stream: bool,
+        prepared: PreparedChapter,
     ) -> int:
+        """Generate missing paragraph chunks for a prepared chapter."""
         generated_chunks = 0
-        for paragraph_index in _pending_block_indexes(completed_blocks, len(blocks)):
-            block = blocks[paragraph_index - 1]
+        for paragraph_index in _pending_block_indexes(prepared.completed_blocks, len(prepared.blocks)):
+            block = prepared.blocks[paragraph_index - 1]
             tts_text = _strip_inline_tags_for_tts(block.text)
             if not _has_spoken_text(tts_text):
                 logger.debug(
                     "Chapter %s | chunk %s/%s | skipped (empty after XML tag cleanup)",
-                    chapter_label,
+                    prepared.job.label,
                     paragraph_index,
-                    len(blocks),
+                    len(prepared.blocks),
                 )
-                progress.upsert_chapter_progress(
-                    chapter_key=chapter_key,
-                    chapter_path=chapter_path,
-                    total_blocks=len(blocks),
+                self._mark_chapter_progress(
+                    prepared=prepared,
                     completed_blocks=paragraph_index,
-                    output_file=str(out_file),
                     completed=False,
                 )
                 continue
             logger.debug(
                 "Chapter %s | chunk %s/%s | start | tag=%s chars=%s",
-                chapter_label,
+                prepared.job.label,
                 paragraph_index,
-                len(blocks),
+                len(prepared.blocks),
                 block.tag,
                 len(tts_text),
             )
             response = self.audio_generator.generate(
                 AudioRequest(
-                    model=settings.model,
+                    model=prepared.job.settings.model,
                     text=tts_text,
-                    voice=settings.voice,
-                    instructions=_instruction_for_block(block, settings),
+                    voice=prepared.job.settings.voice,
+                    instructions=_instruction_for_block(block, prepared.job.settings),
                 ),
-                stream=stream,
+                stream=prepared.job.stream,
             )
-            chunk_path = temp_dir_path / f"chunk_{paragraph_index}.{response.format}"
+            chunk_path = prepared.job.temp_dir / f"chunk_{paragraph_index}.{response.format}"
             chunk_path.write_bytes(response.audio_bytes)
             generated_chunks += 1
             logger.debug(
                 "Chapter %s | chunk %s/%s | done | bytes=%s path=%s",
-                chapter_label,
+                prepared.job.label,
                 paragraph_index,
-                len(blocks),
+                len(prepared.blocks),
                 len(response.audio_bytes),
                 chunk_path,
             )
-            progress.upsert_chapter_progress(
-                chapter_key=chapter_key,
-                chapter_path=chapter_path,
-                total_blocks=len(blocks),
+            self._mark_chapter_progress(
+                prepared=prepared,
                 completed_blocks=paragraph_index,
-                output_file=str(out_file),
                 completed=False,
             )
         return generated_chunks
 
     @staticmethod
     def _collect_block_audio_files(blocks: list[NarrationBlock], temp_dir_path: Path) -> list[tuple[NarrationBlock, Path]]:
+        """Resolve all chunk files and ensure no paragraph chunk is missing before merge."""
         chunk_pairs = [
             (block, _chunk_path_for_index(temp_dir_path, paragraph_index))
             for paragraph_index, block in enumerate(blocks, start=1)
@@ -516,13 +570,15 @@ class AudiobookOrchestrator:
             futures = (
                 executor.submit(
                     self._process_chapter,
-                    i + 1,
-                    total,
-                    chapter,
-                    audiobook_dir,
-                    settings,
-                    progress,
-                    stream
+                    ChapterJob(
+                        index=i + 1,
+                        total=total,
+                        chapter=chapter,
+                        audiobook_dir=audiobook_dir,
+                        settings=settings,
+                        progress=progress,
+                        stream=stream,
+                    ),
                 )
                 for i, chapter in enumerate(book.chapters))
             written = sum(1 for future in as_completed(futures) if future.result())

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -28,6 +29,27 @@ _VOICE_BACKENDS = (_BACKEND_OPENAI_SPEECH,)
 _OUTPUT_FORMATS = ("wav", "mp3")
 
 
+@dataclass(frozen=True)
+class GenerateCommand:
+    """Validated CLI command payload used by generation orchestration."""
+
+    input_path: Path
+    output_path: Path
+    voice_model: str
+    voice_backend: str
+    voice_base_url: str
+    voice: str
+    log_level: str
+    workers: int
+    stream: bool
+    heading_tone: str
+    paragraph_tone: str
+    paragraph_pause_ms: int
+    spool_temp_chunks: bool
+    output_format: str
+    reset_progress: bool
+
+
 def _abort(msg: str) -> None:
     """Print an error and exit with code 1 before any processing begins."""
     console.print(f"[bold red]Error:[/bold red] {msg}")
@@ -37,6 +59,135 @@ def _abort(msg: str) -> None:
 def _build_audio_generator(base_url: str) -> AudioGeneratorPort:
     """Instantiate the OpenAI-compatible ``AudioGeneratorPort`` implementation."""
     return OpenAISpeechAudioGenerator(base_url=base_url)
+
+
+def _validate_input_path(input_path: Path) -> None:
+    """Validate that input path exists and points to a file."""
+    if not input_path.exists():
+        _abort(f"Input file not found: {input_path}")
+    if not input_path.is_file():
+        _abort(f"--in must point to a file, not a directory: {input_path}")
+
+
+def _validate_backend(voice_backend: str) -> None:
+    """Validate selected TTS backend against supported backends."""
+    if voice_backend not in _VOICE_BACKENDS:
+        _abort(f"--voice-backend must be one of: {', '.join(_VOICE_BACKENDS)}")
+
+
+def _normalize_output_format(output_format: str) -> str:
+    """Normalize output format and validate supported values."""
+    normalized = output_format.strip().lower()
+    if normalized not in _OUTPUT_FORMATS:
+        _abort(f"--output-format must be one of: {', '.join(_OUTPUT_FORMATS)}")
+    return normalized
+
+
+def _resolve_output_path(input_path: Path, output_path: Path | None) -> Path:
+    """Resolve and create effective output directory for generated chapters."""
+    effective_path = output_path or input_path.parent / (input_path.stem + "_audiobook")
+    effective_path.mkdir(parents=True, exist_ok=True)
+    return effective_path
+
+
+def _resolve_tts_url(voice_base_url: str) -> str:
+    """Resolve effective TTS base URL from CLI input with sensible default."""
+    return voice_base_url or "http://localhost:8000"
+
+
+def _build_command(
+    *,
+    input_path: Path,
+    output_path: Path | None,
+    voice_model: str,
+    voice_backend: str,
+    voice_base_url: str,
+    voice: str,
+    log_level: str,
+    workers: int,
+    stream: bool,
+    heading_tone: str,
+    paragraph_tone: str,
+    paragraph_pause_ms: int,
+    spool_temp_chunks: bool,
+    output_format: str,
+    reset_progress: bool,
+) -> GenerateCommand:
+    """Build immutable command object after input validation and normalization."""
+    _validate_input_path(input_path)
+    _validate_backend(voice_backend)
+    normalized_output_format = _normalize_output_format(output_format)
+    return GenerateCommand(
+        input_path=input_path,
+        output_path=_resolve_output_path(input_path, output_path),
+        voice_model=voice_model,
+        voice_backend=voice_backend,
+        voice_base_url=_resolve_tts_url(voice_base_url),
+        voice=voice,
+        log_level=log_level,
+        workers=workers,
+        stream=stream,
+        heading_tone=heading_tone.strip(),
+        paragraph_tone=paragraph_tone.strip(),
+        paragraph_pause_ms=paragraph_pause_ms,
+        spool_temp_chunks=spool_temp_chunks,
+        output_format=normalized_output_format,
+        reset_progress=reset_progress,
+    )
+
+
+def _build_audio_settings(command: GenerateCommand) -> AudioSettings:
+    """Map validated CLI command values into domain ``AudioSettings``."""
+    return AudioSettings(
+        model=command.voice_model,
+        base_url=command.voice_base_url,
+        voice=command.voice,
+        heading_tone=command.heading_tone,
+        paragraph_tone=command.paragraph_tone,
+        paragraph_pause_ms=command.paragraph_pause_ms,
+        spool_temp_chunks=command.spool_temp_chunks,
+        chapter_format=command.output_format,
+    )
+
+
+def _duration_hms(total_seconds: float) -> str:
+    """Convert elapsed seconds into ``HH:MM:SS`` format."""
+    hours, rem = divmod(int(total_seconds), 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _render_summary(output_path: Path, chapters_written: int, elapsed_seconds: float) -> None:
+    """Render JSON summary to terminal for machine and human consumption."""
+    console.print(
+        json.dumps(
+            {
+                "out_path": str(output_path),
+                "chapters_written": chapters_written,
+                "audio_duration": _duration_hms(elapsed_seconds),
+            },
+            indent=2,
+        )
+    )
+
+
+def _run_generation(command: GenerateCommand, settings: AudioSettings) -> tuple[int, float]:
+    """Run orchestrator generation and return written chapter count plus elapsed time."""
+    orchestrator = AudiobookOrchestrator(
+        epub_repository=ZipEpubRepository(),
+        audio_generator=_build_audio_generator(command.voice_base_url),
+    )
+    start = time.perf_counter()
+    chapters_written = orchestrator.generate(
+        translated_epub_path=command.input_path,
+        audiobook_dir=command.output_path,
+        settings=settings,
+        workers=command.workers,
+        stream=command.stream,
+        reset_progress=command.reset_progress,
+    )
+    elapsed_seconds = time.perf_counter() - start
+    return chapters_written, elapsed_seconds
 
 
 def generate(
@@ -135,89 +286,44 @@ def generate(
     ] = False,
 ) -> None:
     """Generate an audiobook from an EPUB using a dedicated TTS model/backend."""
-    configure_logging(log_level)
-
-    if not in_path.exists():
-        _abort(f"Input file not found: {in_path}")
-    if not in_path.is_file():
-        _abort(f"--in must point to a file, not a directory: {in_path}")
-
-    if voice_backend not in _VOICE_BACKENDS:
-        _abort(f"--voice-backend must be one of: {', '.join(_VOICE_BACKENDS)}")
-
-    output_format = output_format.strip().lower()
-    if output_format not in _OUTPUT_FORMATS:
-        _abort(f"--output-format must be one of: {', '.join(_OUTPUT_FORMATS)}")
-
-    effective_out_path = out_path or in_path.parent / (in_path.stem + "_audiobook")
-    effective_out_path.mkdir(parents=True, exist_ok=True)
-
-    # Resolve effective TTS base URL: explicit flag > default.
-    if voice_base_url:
-        effective_tts_url = voice_base_url
-    else:
-        effective_tts_url = "http://localhost:8000"
-
-    audio_settings = AudioSettings(
-        model=voice_model,
-        base_url=effective_tts_url,
+    command = _build_command(
+        input_path=in_path,
+        output_path=out_path,
+        voice_model=voice_model,
+        voice_backend=voice_backend,
+        voice_base_url=voice_base_url,
         voice=voice,
-        heading_tone=heading_tone.strip(),
-        paragraph_tone=paragraph_tone.strip(),
+        log_level=log_level,
+        workers=workers,
+        stream=stream,
+        heading_tone=heading_tone,
+        paragraph_tone=paragraph_tone,
         paragraph_pause_ms=paragraph_pause_ms,
         spool_temp_chunks=spool_temp_chunks,
-        chapter_format=output_format,
+        output_format=output_format,
+        reset_progress=reset_progress,
     )
+    configure_logging(command.log_level)
+    audio_settings = _build_audio_settings(command)
 
     logger.info(
         "Starting audiobook generation | in=%s backend=%s model=%s url=%s voice=%s out=%s",
-        in_path,
-        voice_backend,
-        voice_model,
-        effective_tts_url,
-        voice or "(default)",
-        effective_out_path,
+        command.input_path,
+        command.voice_backend,
+        command.voice_model,
+        command.voice_base_url,
+        command.voice or "(default)",
+        command.output_path,
     )
-
-    epub_repo = ZipEpubRepository()
-    audio_generator = _build_audio_generator(effective_tts_url)
-    audio_orchestrator = AudiobookOrchestrator(
-        epub_repository=epub_repo,
-        audio_generator=audio_generator,
-    )
-
-    start = time.perf_counter()
-    chapters_written = audio_orchestrator.generate(
-        translated_epub_path=in_path,
-        audiobook_dir=effective_out_path,
-        settings=audio_settings,
-        workers=workers,
-        stream=stream,
-        reset_progress=reset_progress,
-    )
-    end = time.perf_counter()
-
-    elapsed = end - start
-    hh, rem = divmod(int(elapsed), 3600)
-    mm, ss = divmod(rem, 60)
-    duration_hms = f"{hh:02d}:{mm:02d}:{ss:02d}"
+    chapters_written, elapsed = _run_generation(command, audio_settings)
+    duration_hms = _duration_hms(elapsed)
 
     logger.info(
         "Audiobook generation finished | chapters_written=%s out=%s in %s",
         chapters_written,
-        effective_out_path,
+        command.output_path,
         duration_hms,
     )
-
-    console.print(
-        json.dumps(
-            {
-                "out_path": str(effective_out_path),
-                "chapters_written": chapters_written,
-                "audio_duration": duration_hms,
-            },
-            indent=2,
-        )
-    )
+    _render_summary(command.output_path, chapters_written, elapsed)
 
     raise typer.Exit(code=0)

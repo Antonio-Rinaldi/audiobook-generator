@@ -13,6 +13,7 @@ dependencies = [
   "lxml>=5.1.0",
   "requests>=2.31.0",
   "rich>=13.7.0",
+  "pydub>=0.25.1",
 ]
 
 [project.optional-dependencies]

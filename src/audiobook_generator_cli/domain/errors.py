@@ -1,29 +1,37 @@
 from __future__ import annotations
 
 
-class EpubTranslateError(Exception):
-    """Base error for this application."""
+class AudiobookGeneratorError(Exception):
+    """Base domain error for audiobook generation workflows."""
 
 
-class ValidationError(EpubTranslateError):
+# Backward-compatibility alias for older imports.
+EpubTranslateError = AudiobookGeneratorError
+
+
+class ValidationError(AudiobookGeneratorError):
     """Input validation error."""
 
 
-class EpubReadError(EpubTranslateError):
+class EpubReadError(AudiobookGeneratorError):
     """EPUB read/unpack/parse error."""
 
 
-class EpubWriteError(EpubTranslateError):
+class EpubWriteError(AudiobookGeneratorError):
     """EPUB write/pack error."""
 
 
-class TranslationError(EpubTranslateError):
-    """Request error (may be retryable)."""
+class AudioGenerationError(AudiobookGeneratorError):
+    """Base error for audio generation provider failures."""
 
 
-class RetryableTranslationError(TranslationError):
+# Backward-compatibility alias for older imports.
+TranslationError = AudioGenerationError
+
+
+class RetryableTranslationError(AudioGenerationError):
     """Retryable request error (transient)."""
 
 
-class NonRetryableTranslationError(TranslationError):
+class NonRetryableTranslationError(AudioGenerationError):
     """Non-retryable request error."""

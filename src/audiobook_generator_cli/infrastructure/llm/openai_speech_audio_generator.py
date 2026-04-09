@@ -4,6 +4,7 @@ import io
 import re
 import wave
 from dataclasses import dataclass
+from itertools import chain
 
 import requests
 
@@ -21,6 +22,7 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 
 
 def _response_error_excerpt(resp: requests.Response, max_len: int = 200) -> str:
+    """Extract a short response body excerpt for error diagnostics."""
     try:
         body = resp.content or b""
     except Exception:
@@ -30,76 +32,98 @@ def _response_error_excerpt(resp: requests.Response, max_len: int = 200) -> str:
     return body.decode("utf-8", errors="replace")[:max_len]
 
 
-def _split_text_semantic(text: str, max_chars: int) -> list[str]:
-    cleaned = text.strip()
-    if not cleaned:
-        return []
+@dataclass(frozen=True)
+class SemanticTextChunker:
+    """Split narration text into semantically stable chunks constrained by length."""
 
-    paragraphs = [p.strip() for p in re.split(r"\n{2,}", cleaned) if p.strip()]
-    chunks: list[str] = []
-    current = ""
+    max_chars: int
 
-    def flush_current() -> None:
-        nonlocal current
-        if current.strip():
-            chunks.append(current.strip())
-        current = ""
+    @staticmethod
+    def _paragraphs(text: str) -> list[str]:
+        """Split input text by paragraph boundaries preserving non-empty blocks."""
+        return [paragraph.strip() for paragraph in re.split(r"\n{2,}", text.strip()) if paragraph.strip()]
 
-    def append_part(part: str) -> None:
-        nonlocal current
-        part = part.strip()
-        if not part:
-            return
+    @staticmethod
+    def _sentences(paragraph: str) -> list[str]:
+        """Split one paragraph into sentence-like units."""
+        return [sentence.strip() for sentence in _SENTENCE_SPLIT_RE.split(paragraph) if sentence.strip()]
 
-        candidate = f"{current}\n\n{part}" if current else part
-        if len(candidate) <= max_chars:
-            current = candidate
-            return
+    def _slice_long_text(self, text: str) -> list[str]:
+        """Slice overly long text into hard-sized chunks."""
+        return [
+            text[index : index + self.max_chars].strip()
+            for index in range(0, len(text), self.max_chars)
+            if text[index : index + self.max_chars].strip()
+        ]
 
-        flush_current()
+    def _pack_sentences(self, sentences: list[str]) -> list[str]:
+        """Pack sentence units into chunks under max size with natural boundaries."""
+        packed: list[str] = []
+        accumulator = ""
 
-        if len(part) <= max_chars:
-            current = part
-            return
-
-        sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(part) if s.strip()]
-        if len(sentences) <= 1:
-            for i in range(0, len(part), max_chars):
-                slice_part = part[i : i + max_chars].strip()
-                if slice_part:
-                    chunks.append(slice_part)
-            return
-
-        sentence_acc = ""
         for sentence in sentences:
-            sentence_candidate = f"{sentence_acc} {sentence}".strip() if sentence_acc else sentence
-            if len(sentence_candidate) <= max_chars:
-                sentence_acc = sentence_candidate
+            candidate = f"{accumulator} {sentence}".strip() if accumulator else sentence
+            if len(candidate) <= self.max_chars:
+                accumulator = candidate
                 continue
 
-            if sentence_acc:
-                chunks.append(sentence_acc.strip())
-                sentence_acc = ""
+            if accumulator:
+                packed.append(accumulator)
+                accumulator = ""
 
-            if len(sentence) <= max_chars:
-                sentence_acc = sentence
-            else:
-                for i in range(0, len(sentence), max_chars):
-                    slice_part = sentence[i : i + max_chars].strip()
-                    if slice_part:
-                        chunks.append(slice_part)
+            if len(sentence) <= self.max_chars:
+                accumulator = sentence
+                continue
 
-        if sentence_acc.strip():
-            chunks.append(sentence_acc.strip())
+            packed.extend(self._slice_long_text(sentence))
 
-    for paragraph in paragraphs:
-        append_part(paragraph)
+        if accumulator:
+            packed.append(accumulator)
+        return packed
 
-    flush_current()
-    return chunks
+    def split(self, text: str) -> list[str]:
+        """Return chunk list preserving paragraph and sentence coherence when possible."""
+        paragraphs = self._paragraphs(text)
+        if not paragraphs:
+            return []
+
+        chunks: list[str] = []
+        current_chunk = ""
+
+        for paragraph in paragraphs:
+            candidate = f"{current_chunk}\n\n{paragraph}" if current_chunk else paragraph
+            if len(candidate) <= self.max_chars:
+                current_chunk = candidate
+                continue
+
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+
+            if len(paragraph) <= self.max_chars:
+                current_chunk = paragraph
+                continue
+
+            paragraph_sentences = self._sentences(paragraph)
+            sentence_chunks = (
+                self._pack_sentences(paragraph_sentences)
+                if len(paragraph_sentences) > 1
+                else self._slice_long_text(paragraph)
+            )
+            chunks.extend(sentence_chunks)
+
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        return chunks
+
+
+def _split_text_semantic(text: str, max_chars: int) -> list[str]:
+    """Backward-compatible helper for semantic chunk splitting used by tests."""
+    return SemanticTextChunker(max_chars=max_chars).split(text)
 
 
 def _concat_wav_bytes(parts: list[bytes]) -> bytes:
+    """Concatenate WAV payloads preserving consistent audio header parameters."""
     if not parts:
         return b""
     if len(parts) == 1:
@@ -147,6 +171,7 @@ class OpenAISpeechAudioGenerator(AudioGeneratorPort):
 
     @staticmethod
     def _build_payload(request: AudioRequest, text_chunk: str) -> dict[str, str]:
+        """Build OpenAI-compatible speech payload for one text chunk."""
         optional_pairs = (
             ("voice", request.voice),
             ("instructions", request.instructions),
@@ -160,10 +185,12 @@ class OpenAISpeechAudioGenerator(AudioGeneratorPort):
         }
 
     def _speech_url(self, stream: bool) -> str:
+        """Return endpoint URL for streaming or non-streaming speech requests."""
         suffix = "?stream=true" if stream else ""
         return f"{self.base_url}/v1/audio/speech{suffix}"
 
     def _send_tts_request(self, payload: dict[str, str], stream: bool) -> requests.Response:
+        """Send speech request to backend and convert transport failures to retryable errors."""
         try:
             if stream:
                 return requests.post(self._speech_url(stream=True), json=payload, timeout=self.timeout_s, stream=True)
@@ -173,17 +200,20 @@ class OpenAISpeechAudioGenerator(AudioGeneratorPort):
 
     @staticmethod
     def _extract_audio_bytes(resp: requests.Response, stream: bool) -> bytes:
+        """Extract audio bytes from regular or streaming HTTP responses."""
         if stream:
             return b"".join(chunk for chunk in resp.iter_content(chunk_size=8192) if chunk)
         return resp.content
 
     @staticmethod
     def _detect_output_format(resp: requests.Response) -> str:
+        """Infer audio format from HTTP content-type header."""
         content_type = resp.headers.get("content-type", "audio/wav")
         return "mp3" if "mpeg" in content_type or "mp3" in content_type else "wav"
 
     @staticmethod
     def _validate_response(resp: requests.Response) -> None:
+        """Validate HTTP response status and raise mapped domain errors."""
         if resp.status_code >= 500:
             raise RetryableTranslationError(f"TTS server error: {resp.status_code}")
         if resp.status_code >= 400:
@@ -193,9 +223,11 @@ class OpenAISpeechAudioGenerator(AudioGeneratorPort):
 
     @staticmethod
     def _merge_audio_chunks(audio_chunks: list[bytes], output_format: str) -> bytes:
+        """Merge chunk bytes according to response format semantics."""
         return _concat_wav_bytes(audio_chunks) if output_format == "wav" else b"".join(audio_chunks)
 
     def _fetch_chunk_audio(self, request: AudioRequest, text_chunk: str, stream: bool) -> tuple[bytes, str]:
+        """Generate one audio chunk and return bytes plus detected format."""
         payload = self._build_payload(request, text_chunk)
         resp = self._send_tts_request(payload, stream=stream)
         self._validate_response(resp)

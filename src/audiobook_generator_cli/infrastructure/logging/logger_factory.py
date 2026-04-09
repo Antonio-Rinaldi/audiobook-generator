@@ -6,6 +6,7 @@ _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(name)s | %(message)s"
 
 
 def configure_logging(level: str = "INFO") -> None:
+    """Configure root logger with project format and requested level."""
     resolved_level = getattr(logging, level.upper(), logging.INFO)
 
     root_logger = logging.getLogger()
@@ -18,4 +19,5 @@ def configure_logging(level: str = "INFO") -> None:
 
 
 def create_logger(name: str) -> logging.Logger:
+    """Create module-scoped logger bound to configured logging hierarchy."""
     return logging.getLogger(name)

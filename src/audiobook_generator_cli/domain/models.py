@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ChapterDocument:
+    """EPUB chapter payload extracted from XHTML/HTML resources."""
+
     path: str
     xhtml_bytes: bytes
 
