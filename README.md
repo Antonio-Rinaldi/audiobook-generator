@@ -69,9 +69,9 @@ From chapter XHTML:
 For each chapter block:
 
 - build narration instructions:
-  - base instruction: stable tone/volume + punctuation-aware pacing,
-  - heading instruction: calm heading reading,
-  - optional user overrides from `--heading-tone` / `--paragraph-tone`.
+    - base instruction: stable tone/volume + punctuation-aware pacing,
+    - heading instruction: calm heading reading,
+    - optional user overrides from `--heading-tone` / `--paragraph-tone`.
 - send chunk request to OpenAI-compatible `/v1/audio/speech`.
 - save returned chunk as `chunk_<n>.<fmt>` inside `.audio_chunks/<chapter_id>/`.
 - update progress index with `completed_blocks`.
@@ -107,23 +107,23 @@ Resume behavior:
 
 ## CLI Flags
 
-| Flag | Default | Description |
-|---|---|---|
-| `--in` | required | Input EPUB file path |
-| `--out` | `<in_stem>_audiobook/` | Output directory |
-| `--voice-model` | required | TTS model name |
-| `--voice-backend` | `openai-speech` | TTS backend selector |
-| `--voice-base-url` | `http://localhost:8000` | TTS API base URL |
-| `--voice` | `alloy` | Voice id sent to backend |
-| `--heading-tone` | `""` | Additional style for heading blocks |
-| `--paragraph-tone` | `""` | Additional style for paragraph-like blocks |
-| `--paragraph-pause-ms` | `700` | Silence between paragraph blocks |
-| `--spool-temp-chunks` | `true` | Keep chunk files before merge |
-| `--output-format` / `--chapter-format` | `wav` | Final chapter format (`wav`, `mp3`) |
-| `--workers` | `1` | Parallel chapter workers |
-| `--stream` | `false` | Use streaming responses from backend |
-| `--reset-progress` | `false` | Clear checkpoint and temp chunks |
-| `--log-level` | `INFO` | Logging level (`INFO`, `DEBUG`) |
+| Flag                                   | Default                 | Description                                |
+|----------------------------------------|-------------------------|--------------------------------------------|
+| `--in`                                 | required                | Input EPUB file path                       |
+| `--out`                                | `<in_stem>_audiobook/`  | Output directory                           |
+| `--voice-model`                        | required                | TTS model name                             |
+| `--voice-backend`                      | `openai-speech`         | TTS backend selector                       |
+| `--voice-base-url`                     | `http://localhost:8000` | TTS API base URL                           |
+| `--voice`                              | `alloy`                 | Voice id sent to backend                   |
+| `--heading-tone`                       | `""`                    | Additional style for heading blocks        |
+| `--paragraph-tone`                     | `""`                    | Additional style for paragraph-like blocks |
+| `--paragraph-pause-ms`                 | `700`                   | Silence between paragraph blocks           |
+| `--spool-temp-chunks`                  | `true`                  | Keep chunk files before merge              |
+| `--output-format` / `--chapter-format` | `wav`                   | Final chapter format (`wav`, `mp3`)        |
+| `--workers`                            | `1`                     | Parallel chapter workers                   |
+| `--stream`                             | `false`                 | Use streaming responses from backend       |
+| `--reset-progress`                     | `false`                 | Clear checkpoint and temp chunks           |
+| `--log-level`                          | `INFO`                  | Logging level (`INFO`, `DEBUG`)            |
 
 ---
 
@@ -139,40 +139,39 @@ sequenceDiagram
     participant TTS as OpenAISpeechAudioGenerator
     participant FS as Filesystem
     participant Merge as pydub
-
-    User->>CLI: Run command
-    CLI->>CLI: Validate and normalize GenerateCommand
-    CLI->>Orch: generate(...)
+    User ->> CLI: Run command
+    CLI ->> CLI: Validate and normalize GenerateCommand
+    CLI ->> Orch: generate(...)
 
     alt reset-progress enabled
-        Orch->>FS: Remove .audiobook_progress.json
-        Orch->>FS: Remove .audio_chunks/
+        Orch ->> FS: Remove .audiobook_progress.json
+        Orch ->> FS: Remove .audio_chunks/
     end
 
-    Orch->>Repo: load(epub)
-    Repo-->>Orch: EpubBook(chapters)
+    Orch ->> Repo: load(epub)
+    Repo -->> Orch: EpubBook(chapters)
 
     loop each chapter (workers)
-        Orch->>FS: Write .chapters/chapter_<n>.xml
-        Orch->>Orch: Extract narration blocks
-        Orch->>FS: Read chapter state and chunk continuity
-        Orch->>FS: Upsert in-progress checkpoint
+        Orch ->> FS: Write .chapters/chapter_<n>.xml
+        Orch ->> Orch: Extract narration blocks
+        Orch ->> FS: Read chapter state and chunk continuity
+        Orch ->> FS: Upsert in-progress checkpoint
 
         loop each pending block
-            Orch->>TTS: generate(AudioRequest)
-            TTS-->>Orch: AudioResponse(bytes, format)
-            Orch->>FS: Save chunk_<n>.<fmt>
-            Orch->>FS: Upsert completed_blocks=n
+            Orch ->> TTS: generate(AudioRequest)
+            TTS -->> Orch: AudioResponse(bytes, format)
+            Orch ->> FS: Save chunk_<n>.<fmt>
+            Orch ->> FS: Upsert completed_blocks=n
         end
 
-        Orch->>Merge: Merge chunk files + paragraph pauses
-        Merge->>FS: Export final chapter file
-        Orch->>FS: Delete chapter temp chunks
-        Orch->>FS: Upsert completed=true
+        Orch ->> Merge: Merge chunk files + paragraph pauses
+        Merge ->> FS: Export final chapter file
+        Orch ->> FS: Delete chapter temp chunks
+        Orch ->> FS: Upsert completed=true
     end
 
-    Orch-->>CLI: chapters_written
-    CLI-->>User: JSON summary
+    Orch -->> CLI: chapters_written
+    CLI -->> User: JSON summary
 ```
 
 ---
