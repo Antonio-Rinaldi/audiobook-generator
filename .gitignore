@@ -9,3 +9,4 @@ build/
 /resources/input/
 /resources/output/
 /.idea/
+/.coverage

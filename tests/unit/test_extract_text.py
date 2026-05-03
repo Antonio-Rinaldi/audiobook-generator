@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from audiobook_generator_cli.application.services.audiobook_orchestrator import _extract_paragraphs
+import pytest
+
+from audiobook_generator_cli.application.services.audiobook_orchestrator import (
+    _extract_narration_blocks,
+    _extract_paragraphs,
+)
+from audiobook_generator_cli.domain.errors import EpubReadError
 
 
 def test_extract_paragraphs_collects_headings_and_paragraphs() -> None:
@@ -32,7 +38,11 @@ def test_extract_paragraphs_handles_nested_wrapper_structure_like_chapter_files(
 
     paragraphs = _extract_paragraphs(xhtml)
 
-    assert paragraphs == ["ACCURSED BRIDE.", "CHAPTER 1.", "Il sole al tramonto tingeva le distanze."]
+    assert paragraphs == [
+        "ACCURSED BRIDE.",
+        "CHAPTER 1.",
+        "Il sole al tramonto tingeva le distanze.",
+    ]
 
 
 def test_extract_paragraphs_includes_list_and_quote_blocks() -> None:
@@ -67,3 +77,21 @@ def test_extract_paragraphs_keeps_real_text_and_skips_dot_placeholder() -> None:
     ]
 
 
+def test_extract_narration_blocks_raises_epub_read_error_on_malformed_xhtml() -> None:
+    malformed = b"<html><body><p>Unclosed"
+    with pytest.raises(EpubReadError):
+        _extract_narration_blocks(malformed)
+
+
+def test_extract_paragraphs_ignores_xml_comment_nodes() -> None:
+    xhtml = (
+        b"<?xml version='1.0' encoding='utf-8'?>"
+        b"<html xmlns='http://www.w3.org/1999/xhtml'><body>"
+        b"<!-- editorial comment -->"
+        b"<p>Visible paragraph.</p>"
+        b"</body></html>"
+    )
+
+    paragraphs = _extract_paragraphs(xhtml)
+
+    assert paragraphs == ["Visible paragraph."]

@@ -4,22 +4,20 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from audiobook_generator_cli.domain.errors import EpubReadError, EpubWriteError
+from audiobook_generator_cli.domain.errors import EpubReadError
 from audiobook_generator_cli.domain.models import ChapterDocument
 from audiobook_generator_cli.domain.ports import EpubBook, EpubRepositoryPort
 from audiobook_generator_cli.infrastructure.logging.logger_factory import create_logger
-
 
 logger = create_logger(__name__)
 
 
 @dataclass(frozen=True)
 class ZipEpubRepository(EpubRepositoryPort):
-    """Load and save EPUBs as zip archives.
+    """Load EPUBs from zip archives.
 
-    Notes:
-    - EPUB is a zip container with specific constraints (mimetype must be first and stored).
-    - This implementation preserves all non-chapter items byte-for-byte.
+    EPUB is a zip container with specific constraints (mimetype must be first
+    and stored). This implementation preserves all non-chapter items byte-for-byte.
     """
 
     @staticmethod
@@ -42,22 +40,6 @@ class ZipEpubRepository(EpubRepositoryPort):
             if cls._is_chapter_resource(resource_path)
         ]
 
-    @staticmethod
-    def _write_items(book: EpubBook, output_path: Path) -> None:
-        """Write EPUB resources while preserving ``mimetype`` ordering rules."""
-        with zipfile.ZipFile(output_path, "w") as zip_file:
-            if "mimetype" in book.items:
-                zip_file.writestr(
-                    "mimetype",
-                    book.items["mimetype"],
-                    compress_type=zipfile.ZIP_STORED,
-                )
-
-            for name, content in book.items.items():
-                if name == "mimetype":
-                    continue
-                zip_file.writestr(name, content, compress_type=zipfile.ZIP_DEFLATED)
-
     def load(self, input_path: Path) -> EpubBook:
         """Load EPUB file from disk and return in-memory chapter-aware representation."""
         try:
@@ -67,14 +49,9 @@ class ZipEpubRepository(EpubRepositoryPort):
 
         chapters = self._chapter_documents(items)
 
-        logger.debug("EPUB repository load completed | items=%s chapters=%s", len(items), len(chapters))
+        logger.debug(
+            "EPUB repository load completed | items=%s chapters=%s",
+            len(items),
+            len(chapters),
+        )
         return EpubBook(items=items, chapters=chapters)
-
-    def save(self, book: EpubBook, output_path: Path) -> None:
-        """Persist in-memory EPUB representation to archive file on disk."""
-        try:
-            self._write_items(book, output_path)
-        except Exception as exc:  # noqa: BLE001
-            raise EpubWriteError(str(exc)) from exc
-
-        logger.debug("EPUB repository save completed | items=%s path=%s", len(book.items), output_path)

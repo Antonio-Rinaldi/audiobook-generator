@@ -5,10 +5,6 @@ class AudiobookGeneratorError(Exception):
     """Base domain error for audiobook generation workflows."""
 
 
-# Backward-compatibility alias for older imports.
-EpubTranslateError = AudiobookGeneratorError
-
-
 class ValidationError(AudiobookGeneratorError):
     """Input validation error."""
 
@@ -23,10 +19,6 @@ class EpubWriteError(AudiobookGeneratorError):
 
 class AudioGenerationError(AudiobookGeneratorError):
     """Base error for audio generation provider failures."""
-
-
-# Backward-compatibility alias for older imports.
-TranslationError = AudioGenerationError
 
 
 class RetryableTranslationError(AudioGenerationError):

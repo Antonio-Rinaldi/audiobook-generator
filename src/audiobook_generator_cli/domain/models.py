@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from audiobook_generator_cli.domain.constants import _DEFAULT_TTS_BASE_URL
+
 
 @dataclass(frozen=True)
 class ChapterDocument:
@@ -16,12 +18,11 @@ class AudioSettings:
     """Settings for audiobook generation."""
 
     model: str
-    base_url: str = "http://localhost:11434"
+    base_url: str = _DEFAULT_TTS_BASE_URL
     voice: str = ""
     heading_tone: str = ""
     paragraph_tone: str = ""
     paragraph_pause_ms: int = 700
-    spool_temp_chunks: bool = True
     chapter_format: str = "wav"
 
 
